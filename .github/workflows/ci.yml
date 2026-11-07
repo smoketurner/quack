@@ -95,12 +95,28 @@ jobs:
           pinned=$(rustup show active-toolchain | awk '{print $1}')
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
+        id: cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "clippy-${{ runner.os }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+      # rust-cache's `cache-hit` output is the string 'true' only on an exact
+      # key hit. A Cargo.lock change (every dependency bump) gives this job a
+      # new key, so the restore falls back to a prefix match of main's cache.
+      # That prefix restore brings back libduckdb-sys's extracted bundled
+      # DuckDB sources under target/duckdb-sources/, but the changed Cargo.lock
+      # also makes cargo re-run libduckdb-sys's build script. Its unpack step
+      # renames a staging dir onto target/duckdb-sources/<key>/ and panics with
+      # DirectoryNotEmpty because that tree already exists from the restore.
+      # Clearing it on a non-exact restore lets the script unpack cleanly. This
+      # is a no-op on main (exact hits), so the tuned caching behavior above is
+      # preserved.
+      - name: Clear stale DuckDB bundled sources on partial cache restore
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/duckdb-sources target/*/duckdb-sources
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       # Rustdoc runs here, not in a job of its own: it needs every dependency
       # compiled in check mode, which Clippy just did, so it takes seconds
@@ -145,12 +161,28 @@ jobs:
           pinned=$(rustup show active-toolchain | awk '{print $1}')
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
+        id: cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+      # rust-cache's `cache-hit` output is the string 'true' only on an exact
+      # key hit. A Cargo.lock change (every dependency bump) gives this job a
+      # new key, so the restore falls back to a prefix match of main's cache.
+      # That prefix restore brings back libduckdb-sys's extracted bundled
+      # DuckDB sources under target/duckdb-sources/, but the changed Cargo.lock
+      # also makes cargo re-run libduckdb-sys's build script. Its unpack step
+      # renames a staging dir onto target/duckdb-sources/<key>/ and panics with
+      # DirectoryNotEmpty because that tree already exists from the restore.
+      # Clearing it on a non-exact restore lets the script unpack cleanly. This
+      # is a no-op on main (exact hits), so the tuned caching behavior above is
+      # preserved.
+      - name: Clear stale DuckDB bundled sources on partial cache restore
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/duckdb-sources target/*/duckdb-sources
       - name: Run tests
         run: cargo test --locked --workspace
 
@@ -184,12 +216,28 @@ jobs:
           pinned=$(rustup show active-toolchain | awk '{print $1}')
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
+        id: cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+      # rust-cache's `cache-hit` output is the string 'true' only on an exact
+      # key hit. A Cargo.lock change (every dependency bump) gives this job a
+      # new key, so the restore falls back to a prefix match of main's cache.
+      # That prefix restore brings back libduckdb-sys's extracted bundled
+      # DuckDB sources under target/duckdb-sources/, but the changed Cargo.lock
+      # also makes cargo re-run libduckdb-sys's build script. Its unpack step
+      # renames a staging dir onto target/duckdb-sources/<key>/ and panics with
+      # DirectoryNotEmpty because that tree already exists from the restore.
+      # Clearing it on a non-exact restore lets the script unpack cleanly. This
+      # is a no-op on main (exact hits), so the tuned caching behavior above is
+      # preserved.
+      - name: Clear stale DuckDB bundled sources on partial cache restore
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/duckdb-sources target/*/duckdb-sources
       - name: Run tests
         run: cargo test --locked --workspace
 
