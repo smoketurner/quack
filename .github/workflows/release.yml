@@ -78,6 +78,7 @@ jobs:
       # recompiled DuckDB's C++ amalgamation twice (once for clippy, once for
       # the tests) on every release. `save-if: false` is the restore-only knob.
       - name: Setup Rust cache
+        id: cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.2 # zizmor: ignore[cache-poisoning]
         with:
           prefix-key: "v1"
@@ -86,6 +87,23 @@ jobs:
           # the clippy and the test step here would otherwise each pay.
           shared-key: "debug-${{ runner.os }}"
           save-if: "false"
+      # Mirrors ci.yml and eval.yml. rust-cache's `cache-hit` output is the
+      # string 'true' only on an exact key hit. This job is restore-only
+      # (save-if false): it reads main's debug cache but never writes one. A tag
+      # cut from a Cargo.lock that differs from main's (every version bump, this
+      # PR included) gives the job a new key, so the restore falls back to a
+      # prefix match that brings back libduckdb-sys's extracted bundled DuckDB
+      # sources under target/duckdb-sources/, while the changed lockfile also
+      # makes clippy and test re-run libduckdb-sys's build script. Its unpack
+      # step renames a staging dir onto target/duckdb-sources/<key>/ and panics
+      # with DirectoryNotEmpty because that tree already exists from the restore.
+      # Clearing it on a non-exact restore lets the script unpack cleanly, and it
+      # is a no-op on an exact restore, so the cache-restore timing this job
+      # depends on is preserved.
+      - name: Clear stale DuckDB bundled sources on partial cache restore
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/duckdb-sources target/*/duckdb-sources
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace

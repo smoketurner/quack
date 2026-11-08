@@ -68,12 +68,25 @@ jobs:
           pinned=$(rustup show active-toolchain | awk '{print $1}')
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
+        id: cache
         # Restores the debug cache main's CI saves; this job never writes one.
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
           save-if: false
+      # Same guard ci.yml's cached jobs carry. rust-cache's `cache-hit` is
+      # 'true' only on an exact key hit; this job restores (never saves) main's
+      # debug cache, so a Cargo.lock change yields a prefix restore that brings
+      # back libduckdb-sys's extracted target/duckdb-sources/ while the changed
+      # lockfile makes `make eval`'s build re-run libduckdb-sys's build script.
+      # Its unpack then renames onto that pre-existing tree and panics with
+      # DirectoryNotEmpty. Clearing it on a non-exact restore lets the script
+      # unpack cleanly; it is a no-op on an exact restore.
+      - name: Clear stale DuckDB bundled sources on partial cache restore
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/duckdb-sources target/*/duckdb-sources
       - name: Install and start Ollama
         uses: ai-action/setup-ollama@85cd2094215be6b76d0ad90e93393647dc7a55ba # v2.1.16
         env:
