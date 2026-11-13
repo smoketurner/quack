@@ -630,11 +630,8 @@ fn rows_of(buffer: &Buffer) -> Vec<String> {
 
 /// The rows of a frame drawn 80 columns by 30 rows.
 fn screen(app: &App) -> Vec<String> {
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30))
-        .unwrap_or_else(|e| match e {});
-    terminal
-        .draw(|frame| ui::draw(frame, app))
-        .unwrap_or_else(|e| match e {});
+    let Ok(mut terminal) = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30));
+    let Ok(_) = terminal.draw(|frame| ui::draw(frame, app));
     rows_of(terminal.backend().buffer())
 }
 
@@ -1029,8 +1026,7 @@ async fn the_event_loop_answers_typed_sql_and_quits_on_ctrl_c() {
         assert!(keys.unbounded_send(press(KeyCode::Char(ch))).is_ok());
     }
     assert!(keys.unbounded_send(press(KeyCode::Enter)).is_ok());
-    let mut terminal =
-        ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap_or_else(|e| match e {});
+    let Ok(mut terminal) = ratatui::Terminal::new(TestBackend::new(80, 30));
     let running = tokio::spawn(async move {
         let result = app
             .run_with(&mut terminal, input, Clipboard::terminal_only(Vec::new()))
@@ -2337,8 +2333,7 @@ async fn the_event_loop_highlights_a_selection_and_copies_it() {
     }
     // The stream's end stops the loop.
     drop(events);
-    let mut terminal =
-        ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap_or_else(|e| match e {});
+    let Ok(mut terminal) = ratatui::Terminal::new(TestBackend::new(80, 30));
     let mut sent = Vec::new();
     let result = app
         .run_with(&mut terminal, input, Clipboard::terminal_only(&mut sent))

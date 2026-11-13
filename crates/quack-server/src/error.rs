@@ -820,14 +820,13 @@ mod tests {
         router: Router,
         path: &str,
     ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
-        let response = router
+        let Ok(response) = router
             .oneshot(
                 axum::http::Request::get(path)
                     .body(Body::empty())
                     .unwrap_or_else(|e| fail(&e.to_string())),
             )
-            .await
-            .unwrap_or_else(|e| match e {});
+            .await;
         let (parts, body) = response.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX)
             .await

@@ -336,12 +336,7 @@ impl Harness {
     }
 
     async fn send(&self, request: Request<Body>) -> Reply {
-        let response = self
-            .router
-            .clone()
-            .oneshot(request)
-            .await
-            .unwrap_or_else(|e| match e {});
+        let Ok(response) = self.router.clone().oneshot(request).await;
         let status = response.status();
         let header_text = |name| {
             response
@@ -913,15 +908,14 @@ async fn without_oidc_there_is_no_button_and_no_route() {
         ("/login", StatusCode::OK),
         (OidcConfig::START_PATH, StatusCode::NOT_FOUND),
     ] {
-        let response = router
+        let Ok(response) = router
             .clone()
             .oneshot(
                 Request::get(uri)
                     .body(Body::empty())
                     .unwrap_or_else(|e| fail(&e.to_string())),
             )
-            .await
-            .unwrap_or_else(|e| match e {});
+            .await;
         assert_eq!(response.status(), status, "{uri}");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1278,7 +1272,7 @@ impl Harness {
             .header(credential.0, credential.1)
             .body(Body::empty())
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let response = router.oneshot(request).await.unwrap_or_else(|e| match e {});
+        let Ok(response) = router.oneshot(request).await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

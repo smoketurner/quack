@@ -3079,11 +3079,8 @@ async fn local_mode_refuses_a_host_that_is_not_loopback() {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let router = router.clone();
         async move {
-            router
-                .oneshot(request)
-                .await
-                .unwrap_or_else(|e| match e {})
-                .status()
+            let Ok(response) = router.oneshot(request).await;
+            response.status()
         }
     };
     assert_eq!(ask(Some("127.0.0.1:8080")).await, StatusCode::OK);
@@ -3202,7 +3199,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
                 .uri(path)
                 .body(Body::empty())
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            let response = router.oneshot(request).await.unwrap_or_else(|e| match e {});
+            let Ok(response) = router.oneshot(request).await;
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -3230,11 +3227,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
         .header("content-type", "application/json")
         .body(Body::from(r#"{"name":"viaweb"}"#))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = router
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap_or_else(|e| match e {});
+    let Ok(response) = router.clone().oneshot(request).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -3262,7 +3255,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
         .uri("/workspaces")
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = router.oneshot(page).await.unwrap_or_else(|e| match e {});
+    let Ok(response) = router.oneshot(page).await;
     assert_eq!(response.status(), StatusCode::OK);
     let html = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -5755,12 +5748,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         .uri(format!("/api/v1/workspaces/{ws}/okf"))
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = h
-        .router
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap_or_else(|e| match e {});
+    let Ok(response) = h.router.clone().oneshot(request).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
@@ -7027,12 +7015,7 @@ async fn the_jobs_page_follows_the_job_stream_with_the_session_cookie() {
         .header(header::COOKIE, format!("quack_session={cookie}"))
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = h
-        .router
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap_or_else(|e| match e {});
+    let Ok(response) = h.router.clone().oneshot(request).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
         response
@@ -7361,12 +7344,7 @@ async fn the_jobs_stream_ends_when_the_server_begins_to_stop() {
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = h
-        .router
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap_or_else(|e| match e {});
+    let Ok(response) = h.router.clone().oneshot(request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     h.app.engine.stop_jobs(std::time::Duration::ZERO).await;
@@ -9766,7 +9744,7 @@ async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let h = h.router.clone();
         async move {
-            let response = h.oneshot(request).await.unwrap_or_else(|e| match e {});
+            let Ok(response) = h.oneshot(request).await;
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -10577,12 +10555,7 @@ async fn readiness_and_metrics_are_served_outside_the_limiter() {
         .header(header::AUTHORIZATION, format!("Bearer {admin}"))
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = h
-        .router
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap_or_else(|e| match e {});
+    let Ok(response) = h.router.clone().oneshot(request).await;
     assert_eq!(response.status(), StatusCode::OK);
     let text = String::from_utf8(
         axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -11294,12 +11267,7 @@ async fn the_graph_exports_as_a_download_audited_with_its_counts() {
         .uri(format!("{base}/graph/export?format=graphml"))
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = h
-        .router
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap_or_else(|e| match e {});
+    let Ok(response) = h.router.clone().oneshot(request).await;
     assert_eq!(response.status(), StatusCode::OK);
     let header_of = |name| {
         response
