@@ -195,8 +195,7 @@ async fn systemone(State(shared): State<Shared>, body: String) -> (StatusCode, J
     let values: Vec<&str> = request
         .get("state")
         .and_then(Value::as_object)
-        .map(|state| state.values().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+        .map_or_default(|state| state.values().filter_map(Value::as_str).collect());
     let seen = Seen {
         chars: values.iter().map(|v| v.chars().count()).sum(),
         text: values.join(" "),
@@ -226,8 +225,7 @@ impl Seen {
                 Some("choice") => {
                     let options: Vec<String> = criteria
                         .as_object()
-                        .map(|o| o.keys().cloned().collect())
-                        .unwrap_or_default();
+                        .map_or_default(|o| o.keys().cloned().collect());
                     let chosen = options
                         .iter()
                         .find(|o| lower.contains(&o.to_lowercase()))

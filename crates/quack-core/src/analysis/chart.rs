@@ -330,8 +330,7 @@ mod tests {
         let message = |x: &str, columns: SeriesColumns<'_>| {
             ChartSpec::from_results(&sample_results(), ChartKind::Bar, x, columns, "t")
                 .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
+                .map_or_default(|e| e.to_string())
         };
         let returned = "the query returned columns: region, sales";
         let missing_x = message("missing", one("sales"));

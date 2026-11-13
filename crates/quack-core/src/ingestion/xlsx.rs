@@ -803,8 +803,7 @@ mod tests {
                 .collect();
         let err = sheets(&workbook("A1:XFD6105", &rows), BUDGET)
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(
             err.contains("would load 100024320 cells (6105 rows by 16384 columns)"),
             "{err}"

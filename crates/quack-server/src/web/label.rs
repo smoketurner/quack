@@ -201,8 +201,7 @@ impl LabelEditor {
             .set
             .key_reason
             .note()
-            .map(|note| format!(" ({note})"))
-            .unwrap_or_default();
+            .map_or_default(|note| format!(" ({note})"));
         Self {
             ws_id: ws_id.to_string(),
             table: draft.table.clone(),

@@ -183,8 +183,7 @@ impl TableCards {
             let profile = profiles.get(table);
             for (index, (name, kind)) in columns
                 .get(table)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
+                .map_or_default(Vec::as_slice)
                 .iter()
                 .take(CARD_COLUMNS)
                 .enumerate()

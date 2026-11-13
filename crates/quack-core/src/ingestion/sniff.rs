@@ -94,7 +94,7 @@ mod tests {
         if !wrote {
             return Vec::new();
         }
-        out.finish().map(Cursor::into_inner).unwrap_or_default()
+        out.finish().map_or_default(Cursor::into_inner)
     }
 
     fn is(bytes: &[u8], ext: &str) {

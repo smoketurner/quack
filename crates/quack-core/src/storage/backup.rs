@@ -89,8 +89,7 @@ impl Described {
             allowed_providers: workspace
                 .allowed_providers
                 .names()
-                .map(|names| names.iter().cloned().collect())
-                .unwrap_or_default(),
+                .map_or_default(|names| names.iter().cloned().collect()),
             members,
         })
     }
@@ -473,8 +472,7 @@ mod tests {
         let newer = manifest
             .check_readable()
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(newer.contains("upgrade quack"), "{newer}");
         manifest.schema_version = None;
         manifest.format = FORMAT_VERSION.saturating_add(1);

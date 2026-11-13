@@ -648,12 +648,11 @@ mod tests {
             .as_value()
             .pointer(path)
             .and_then(serde_json::Value::as_array)
-            .map(|ids| {
+            .map_or_default(|ids| {
                 ids.iter()
                     .filter_map(|id| id.as_str().map(str::to_owned))
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     #[test]

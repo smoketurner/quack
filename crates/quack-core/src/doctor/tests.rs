@@ -989,8 +989,7 @@ async fn grant_listing_issuer(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = listener
         .local_addr()
-        .map(|a| format!("http://{a}"))
-        .unwrap_or_default();
+        .map_or_default(|a| format!("http://{a}"));
     let tokens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (served, counted) = (base.clone(), std::sync::Arc::clone(&tokens));
     tokio::spawn(async move {

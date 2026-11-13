@@ -32,10 +32,7 @@ fn a_default_workspace_no_workspace_may_take_is_refused() {
         toml::from_str::<Config>(&format!("[general]\ndefault_workspace = \"{name}\"\n"))
     };
     assert!(named(" sales ").is_ok_and(|c| c.general.default_workspace.as_str() == "sales"));
-    let refused = named("a.b/c")
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    let refused = named("a.b/c").err().map_or_default(|e| e.to_string());
     assert!(
         refused.contains(&Error::InvalidWorkspaceName.to_string()),
         "{refused}"
@@ -234,12 +231,7 @@ fn provider_auth_is_one_of_three_shapes() {
         if table {
             text.push_str(oauth);
         }
-        Config::parse(&text).map(|c| {
-            c.providers
-                .get("p")
-                .map(|p| p.auth.mode())
-                .unwrap_or_default()
-        })
+        Config::parse(&text).map(|c| c.providers.get("p").map_or_default(|p| p.auth.mode()))
     };
     assert!(case("none", false, false).is_ok_and(|m| m == AuthMode::None));
     assert!(case("api-key", true, false).is_ok_and(|m| m == AuthMode::ApiKey));
@@ -932,8 +924,7 @@ fn background_work_runs_on_its_own_model_or_the_chat_model() {
     assert_eq!(config.chat_model_ref().unwrap().to_string(), "cloud/big");
     let err = parse("[analysis]\nbackground_model = \"missing/small\"\n")
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("background_model"), "{err}");
 }
 

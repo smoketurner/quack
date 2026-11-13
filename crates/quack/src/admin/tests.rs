@@ -42,8 +42,7 @@ fn roles_scopes_and_outcomes_parse_at_the_command_line() {
     ));
     let refused = parse(&["member", "add", "ann", "--role", "boss"])
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         refused.contains("use one of: viewer, member, owner"),
         "{refused}"
@@ -116,8 +115,7 @@ fn workspace_create_refuses_a_name_the_api_would() {
     for refused in ["a.b/c", "a\\b", ""] {
         let message = parse(&["workspace", "create", refused])
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(
             message.contains(&CoreError::InvalidWorkspaceName.to_string()),
             "{refused:?}: {message}"

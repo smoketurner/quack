@@ -287,8 +287,7 @@ async fn loopback_hosts_are_refused_without_the_private_host_grant() {
         )
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("private address"), "{err}");
     let err = download
         .fetch(
@@ -298,8 +297,7 @@ async fn loopback_hosts_are_refused_without_the_private_host_grant() {
         )
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("private address"), "{err}");
 }
 
@@ -324,8 +322,7 @@ async fn urls_take_every_extension_ingest_loads_as_a_table() {
             .fetch(&SourceUrl::from(accepted), "t", Vec::new())
             .await
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(err.contains("private address"), "{accepted}: {err}");
     }
     for refused in ["http://127.0.0.1:9/notes.pdf", "http://127.0.0.1:9/data"] {
@@ -333,8 +330,7 @@ async fn urls_take_every_extension_ingest_loads_as_a_table() {
             .fetch(&SourceUrl::from(refused), "t", Vec::new())
             .await
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(
             err.contains("must name a table file") && err.contains(".ods"),
             "{refused}: {err}"
@@ -348,7 +344,7 @@ async fn serve_once(response: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|e| unreachable_bind(&e.to_string()));
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
+    let port = listener.local_addr().map_or_default(|a| a.port());
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let Ok((mut socket, _)) = listener.accept().await else {
@@ -395,8 +391,7 @@ async fn a_public_only_download_through_a_proxy_leaves_the_name_to_the_proxy() {
             .fetch(&SourceUrl::from(private), "t", Vec::new())
             .await
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(err.contains("a private address"), "{private}: {err}");
     }
 }
@@ -419,8 +414,7 @@ async fn a_proxy_does_not_open_this_machine_to_a_public_only_download() {
             .fetch(&SourceUrl::from(local), "t", Vec::new())
             .await
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(err.contains("a private address"), "{local}: {err}");
     }
 }
@@ -446,8 +440,7 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
         .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("max_download_mb"), "{err}");
 
     let url = serve_once(
@@ -458,8 +451,7 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
         .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("max_download_mb"), "{err}");
 
     let roomy = Download { max_mb: 1, ..owner };
@@ -485,8 +477,7 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
         .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         err.contains("download failed") && !err.contains("302 Found"),
         "{err}"
@@ -527,8 +518,7 @@ async fn downloaded_files_are_cut_to_the_row_cap() {
     let kept = db
         .run(|db| db.execute_query("SELECT n FROM rows ORDER BY n"))
         .await
-        .map(|r| r.rows.len())
-        .unwrap_or_default();
+        .map_or_default(|r| r.rows.len());
     assert_eq!(kept, 2);
 }
 
@@ -635,8 +625,7 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
         .run()
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
         assert!(err.contains("own data directory"), "{url}: {err}");
     }
     assert!(!SourceUrl::from("sqlite:/tmp/other.db").is_under(&config.general.data_dir));
@@ -655,8 +644,7 @@ async fn a_missing_sqlite_source_is_an_error_and_is_not_created() {
     let err = fetch_rows(&missing, "SELECT 1", 10)
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("cannot open the source"), "{err}");
     assert!(!missing.exists());
 }
@@ -689,8 +677,7 @@ fn a_bearer_token_comes_from_the_environment_when_the_download_starts() {
     let missing = header
         .resolve(|_| None)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(missing.contains("SALES_API_TOKEN is not set"), "{missing}");
     let blank = header.resolve(|_| Some(String::from("  "))).is_err();
     assert!(blank);
@@ -716,13 +703,7 @@ fn a_json_pointer_selects_the_rows_inside_an_envelope() {
         pointer("").rows(b"[1]").ok().as_deref(),
         Some(b"[1]".as_slice())
     );
-    let error = |p: &str, d: &[u8]| {
-        pointer(p)
-            .rows(d)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default()
-    };
+    let error = |p: &str, d: &[u8]| pointer(p).rows(d).err().map_or_default(|e| e.to_string());
     assert!(error("/data/missing", document).contains("nothing at /data/missing"));
     assert!(error("/status", document).contains("not an array"));
     assert!(error("/data", b"not json").contains("not JSON"));
@@ -788,7 +769,7 @@ async fn a_download_sends_its_headers() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|e| unreachable_bind(&e.to_string()));
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
+    let port = listener.local_addr().map_or_default(|a| a.port());
     let received = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let Ok((mut socket, _)) = listener.accept().await else {

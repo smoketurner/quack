@@ -226,8 +226,7 @@ fn an_import_with_a_secret_is_saved_only_sealed() {
     let refused = request
         .check_saveable(KeepSecret::No)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(refused.contains("--store-credential"), "{refused}");
     assert!(refused.contains("--bearer-env"), "{refused}");
     assert!(

@@ -117,7 +117,7 @@ impl ResolvedPrompts {
     #[must_use]
     pub fn for_model(config: &Config, model: &str) -> Self {
         let family = presets::Family::of(model);
-        let mut prompts = family.map(presets::Family::prompts).unwrap_or_default();
+        let mut prompts = family.map_or_default(presets::Family::prompts);
         let overrides = &config.embedding;
         let mut overridden = false;
         for (value, slot) in [

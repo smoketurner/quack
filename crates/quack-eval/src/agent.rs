@@ -160,8 +160,9 @@ impl AgentOutcome {
                 .iter()
                 .rev()
                 .find_map(|step| step.result.as_ref())
-                .map(|result| result.rows.iter().take(RESULT_ROWS_KEPT).cloned().collect())
-                .unwrap_or_default(),
+                .map_or_default(|result| {
+                    result.rows.iter().take(RESULT_ROWS_KEPT).cloned().collect()
+                }),
             error: None,
             question: case.question.clone(),
             kind: kind.to_owned(),

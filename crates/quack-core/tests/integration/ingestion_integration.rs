@@ -3316,8 +3316,7 @@ async fn a_deck_of_unread_pictures_names_the_vision_setting() {
     )
     .await
     .err()
-    .map(|e| e.to_string())
-    .unwrap_or_default();
+    .map_or_default(|e| e.to_string());
     assert!(failed.contains("[ingestion].vision_model"), "{failed}");
 }
 
@@ -3403,8 +3402,7 @@ async fn a_scanned_pdf_without_a_vision_model_names_the_setting() {
     )
     .await
     .err()
-    .map(|e| e.to_string())
-    .unwrap_or_default();
+    .map_or_default(|e| e.to_string());
     assert!(failed.contains("[ingestion].vision_model"), "{failed}");
 }
 
@@ -3462,12 +3460,11 @@ async fn an_image_the_model_cannot_read_leaves_no_file() {
         .unwrap();
     assert_eq!(document.status, DocumentStatus::Error);
     let files: Vec<String> = std::fs::read_dir(config.workspace_files_dir("ws-unread"))
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     assert!(
         !files.iter().any(|f| f.starts_with(document.id.as_str())),
         "{files:?}"
@@ -3965,7 +3962,7 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
         None::<&Embedder<MockEmbeddingModel>>,
     )
     .await;
-    let err = changed.err().map(|e| e.to_string()).unwrap_or_default();
+    let err = changed.err().map_or_default(|e| e.to_string());
     assert!(err.contains("belongs to document"), "{err}");
     assert!(err.contains(first.document_id.as_str()), "{err}");
     assert_eq!(
@@ -5202,8 +5199,7 @@ async fn the_uploaders_fields_win_and_a_person_edits_them() {
             },
         )
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(bad.contains("is not a date"), "{bad}");
     assert!(
         db.set_document_fields(&DocumentId::from("absent"), &DocumentFields::default())

@@ -1105,7 +1105,7 @@ async fn a_socket_sql_write_asks_the_listener_or_is_refused() {
     assert_eq!(tables.results.rows, vec![vec![serde_json::json!("u")]]);
     client.close().await;
     socket.close(Duration::from_secs(5)).await;
-    let reported = reports.lock().map(|r| r.clone()).unwrap_or_default();
+    let reported = reports.lock().map_or_default(|r| r.clone());
     assert!(
         reported.iter().any(|message| {
             message.contains("waiting for approval at the quack terminal session (up to 300 s)")

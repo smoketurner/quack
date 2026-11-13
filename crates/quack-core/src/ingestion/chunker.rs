@@ -670,9 +670,7 @@ mod kind_tests {
             std::iter::once(vec![String::from("Item"), String::from("Amount")])
                 .chain((0..30).map(|i| vec![format!("item number {i}"), format!("{i}00")]))
                 .collect();
-        let table = Table::from_rows(rows)
-            .map(|t| t.render())
-            .unwrap_or_default();
+        let table = Table::from_rows(rows).map_or_default(|t| t.render());
         let pieces = chunker().table(&table);
         assert!(pieces.len() > 1, "{pieces:?}");
         for piece in &pieces {

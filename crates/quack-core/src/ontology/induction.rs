@@ -288,7 +288,7 @@ impl InductionPass<'_> {
                 self.candidates.push(Candidate {
                     proposal: Proposal::Property {
                         class: class_id.clone(),
-                        property: Property::new(property_id.clone(), kind, values),
+                        property: Property::new(property_id, kind, values),
                     },
                     evidence: serde_json::json!({
                         "table": profile.table,

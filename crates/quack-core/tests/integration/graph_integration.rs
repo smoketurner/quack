@@ -1442,8 +1442,7 @@ fn aliases_resolve_case_and_whitespace_insensitively_like_primary_labels() {
         traverse::resolve_entry(&db, entity, class, None)
             .unwrap()
             .first()
-            .map(|n| n.label.clone())
-            .unwrap_or_default()
+            .map_or_default(|n| n.label.clone())
     };
 
     // Case-differing alias resolves, no embedder (the terminal's worst case).
@@ -1788,8 +1787,7 @@ fn renaming_a_relation_moves_its_mapping_and_its_edges() {
     );
     let mapped: Vec<&str> = renamed
         .mapping_for_table("shipments")
-        .map(|m| m.relations.iter().map(|r| r.relation.as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|m| m.relations.iter().map(|r| r.relation.as_str()).collect());
     assert_eq!(mapped, ["sourced_from", "delivered_to"]);
     assert_eq!(
         since_version(&db, "_quack_ontology_relations", "sourced_from"),
@@ -2045,8 +2043,7 @@ fn a_person_asserts_nodes_and_edges_under_the_ontology() {
         &ada,
     )
     .err()
-    .map(|e| e.to_string())
-    .unwrap_or_default();
+    .map_or_default(|e| e.to_string());
     assert!(bad.contains("no class 'vessel'"), "{bad}");
     let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
     assert!(added.created);
@@ -2085,8 +2082,7 @@ fn a_person_asserts_nodes_and_edges_under_the_ontology() {
     assert!(edge.created);
     let refused = graph_store::create_edge(&db, &supplied_by(&kenya.id, &po1.id), &ada)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         refused.contains("does not allow supplied_by from a country to a shipment"),
         "{refused}"
@@ -2106,8 +2102,7 @@ fn a_person_asserts_nodes_and_edges_under_the_ontology() {
     );
     let ambiguous = graph_store::find_node(&db, "Kenya", Some("vendor"))
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(ambiguous.contains("graph node"), "{ambiguous}");
 }
 
@@ -2160,8 +2155,7 @@ fn a_person_corrects_a_node_under_the_ontology() {
         &Assertion::default(),
     )
     .err()
-    .map(|e| e.to_string())
-    .unwrap_or_default();
+    .map_or_default(|e| e.to_string());
     assert!(
         taken.contains("already has the label 'Orgenics'"),
         "{taken}"
@@ -2176,8 +2170,7 @@ fn a_person_corrects_a_node_under_the_ontology() {
         &Assertion::default(),
     )
     .err()
-    .map(|e| e.to_string())
-    .unwrap_or_default();
+    .map_or_default(|e| e.to_string());
     assert!(
         misfit.contains("could not take its edge supplied_by"),
         "{misfit}"
@@ -2227,8 +2220,7 @@ fn a_reset_keeps_assertions_and_deletes_cascade() {
     assert_eq!(orphans, 0);
     let missing = graph_store::delete_node(&db, &orgenics.id)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(missing.contains("graph node"), "{missing}");
     let po3 = graph_store::find_node(&db, "PO-3", None).unwrap();
     let edges = graph_store::edges(

@@ -117,8 +117,7 @@ impl Properties {
     #[must_use]
     pub fn from_column(text: Option<&str>) -> Self {
         text.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
-            .map(Self::from)
-            .unwrap_or_default()
+            .map_or_default(Self::from)
     }
 
     #[must_use]
@@ -207,12 +206,11 @@ impl Properties {
         self.0
             .get(ALIASES)
             .and_then(serde_json::Value::as_array)
-            .map(|a| {
+            .map_or_default(|a| {
                 a.iter()
                     .filter_map(|v| v.as_str().map(str::to_owned))
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     pub fn set_aliases(&mut self, aliases: &[String]) {

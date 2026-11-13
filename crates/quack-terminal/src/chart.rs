@@ -93,11 +93,7 @@ impl ChartData {
     pub(crate) fn from_spec(spec: &ChartSpec) -> Self {
         let title = spec.title.clone();
         let labels = spec.x.values.clone();
-        let first = spec
-            .series
-            .first()
-            .map(|s| s.values.as_slice())
-            .unwrap_or_default();
+        let first = spec.series.first().map_or_default(|s| s.values.as_slice());
         let plot = match spec.kind {
             // Stacked bars: one bar per label of the series' sum, the
             // parts named in the title, since the widget draws no stacks.
@@ -716,8 +712,7 @@ mod tests {
         let colors = |x: u16, y: u16| {
             buffer
                 .cell((x, y))
-                .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
-                .unwrap_or_default()
+                .map_or_default(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
         };
         // Inside the border and a column's margin the circle is 20
         // columns by 10 rows. A fills

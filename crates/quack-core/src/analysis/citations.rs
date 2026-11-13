@@ -216,7 +216,7 @@ impl CitationRegistry {
 
     #[must_use]
     pub fn all(&self) -> Vec<Citation> {
-        self.inner.lock().map(|c| c.clone()).unwrap_or_default()
+        self.inner.lock().map_or_default(|c| c.clone())
     }
 
     /// Keep the `[n]` markers in `answer` that name a registered chunk,

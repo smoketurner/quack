@@ -296,7 +296,7 @@ impl AuditRow {
         let tools: Vec<Value> = detail
             .get("steps")
             .and_then(Value::as_array)
-            .map(|steps| {
+            .map_or_default(|steps| {
                 steps
                     .iter()
                     .map(|s| {
@@ -308,8 +308,7 @@ impl AuditRow {
                         })
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let mut resources = object
             .get("resources")
             .and_then(Value::as_array)

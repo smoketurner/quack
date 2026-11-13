@@ -154,8 +154,7 @@ impl DocumentMeta {
                 .value()
                 .attr("name")
                 .or_else(|| element.value().attr("property"))
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
+                .map_or_default(str::to_ascii_lowercase);
             let content = element.value().attr("content");
             match name.as_str() {
                 "author" | "dc.creator" | "dcterms.creator" | "article:author" => {

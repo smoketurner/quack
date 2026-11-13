@@ -120,10 +120,7 @@ impl MockIssuer {
     }
 
     fn jwks_fetches(&self) -> usize {
-        self.state
-            .lock()
-            .map(|s| s.jwks_fetches)
-            .unwrap_or_default()
+        self.state.lock().map_or_default(|s| s.jwks_fetches)
     }
 }
 
@@ -281,9 +278,7 @@ fn in_an_hour() -> i64 {
 }
 
 fn query(url: &str) -> HashMap<String, String> {
-    Url::parse(url)
-        .map(|u| u.query_pairs().into_owned().collect())
-        .unwrap_or_default()
+    Url::parse(url).map_or_default(|u| u.query_pairs().into_owned().collect())
 }
 
 #[tokio::test]
@@ -635,10 +630,11 @@ async fn tokens_that_fail_a_check_are_refused_as_bearer_errors() {
         "no subject",
     )
     .await;
+    let shared = EncodingKey::from_secret(b"shared").unwrap_or_else(|e| fail(&e.to_string()));
     let hmac = jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         &access_claims(&url, |_| {}),
-        &EncodingKey::from_secret(b"shared"),
+        &shared,
     )
     .unwrap_or_else(|e| fail(&e.to_string()));
     refused(hmac, "shared-secret algorithm").await;
@@ -770,26 +766,22 @@ impl MockIssuer {
     }
 
     fn par_bodies(&self) -> Vec<HashMap<String, String>> {
-        self.state
-            .lock()
-            .map(|s| {
-                s.par_bodies
-                    .iter()
-                    .map(|b| {
-                        oauth2::url::form_urlencoded::parse(b.as_bytes())
-                            .into_owned()
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.state.lock().map_or_default(|s| {
+            s.par_bodies
+                .iter()
+                .map(|b| {
+                    oauth2::url::form_urlencoded::parse(b.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .collect()
+        })
     }
 
     fn spent_and_refused(&self) -> (usize, Vec<String>) {
         self.state
             .lock()
-            .map(|s| (s.spent.len(), s.refused.clone()))
-            .unwrap_or_default()
+            .map_or_default(|s| (s.spent.len(), s.refused.clone()))
     }
 }
 

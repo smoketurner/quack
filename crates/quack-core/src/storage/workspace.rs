@@ -4408,8 +4408,7 @@ impl WorkspaceDb {
             TableProfile::current(self, table_name, u64::try_from(row_count).unwrap_or(0))?;
         let warnings = profile
             .as_ref()
-            .map(|p| p.warnings(mapping.map(|m| m.key.as_str())))
-            .unwrap_or_default();
+            .map_or_default(|p| p.warnings(mapping.map(|m| m.key.as_str())));
         Ok(TableDescription {
             table_name: table_name.to_owned(),
             columns,
@@ -4419,8 +4418,7 @@ impl WorkspaceDb {
             profile,
             warnings,
             measures: ontology
-                .map(|o| o.measures_on(table_name).into_iter().cloned().collect())
-                .unwrap_or_default(),
+                .map_or_default(|o| o.measures_on(table_name).into_iter().cloned().collect()),
             labelled_by,
             label_set: Draft::approved(self, table_name)?,
         })
@@ -6316,8 +6314,7 @@ fn collect_value_filters(node: &serde_json::Value, out: &mut Vec<ValueFilter>) {
                 Some("COMPARE_IN") => map
                     .get("children")
                     .and_then(serde_json::Value::as_array)
-                    .map(|c| c.iter().collect())
-                    .unwrap_or_default(),
+                    .map_or_default(|c| c.iter().collect()),
                 _ => Vec::new(),
             };
             if let Some((column, folded)) = operands.iter().find_map(|o| column_of(o)) {

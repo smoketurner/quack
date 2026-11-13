@@ -46,8 +46,7 @@ fn a_webhook_needs_its_secret_and_a_url_and_is_off_without_a_section() {
     assert!(matches!(Webhook::from_config(None), Ok(None)));
     let unset = Webhook::with_secret(&config("https://hooks.example.com/q", vec![]), None)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(unset.contains("QUACK_TEST_WEBHOOK_SECRET"), "{unset}");
     assert!(
         Webhook::with_secret(

@@ -201,13 +201,13 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(
-            refused.err().map(|e| e.to_string()).unwrap_or_default(),
+            refused.err().map_or_default(|e| e.to_string()),
             "provider 'hosted' is not allowed in this workspace, which allows only: local, ollama"
         );
         // A list that names nothing allows nothing.
         let none = permit_under(Some(only(&[])), "ollama", ProviderType::Ollama, None).await;
         assert_eq!(
-            none.err().map(|e| e.to_string()).unwrap_or_default(),
+            none.err().map_or_default(|e| e.to_string()),
             "provider 'ollama' is not allowed in this workspace, which allows no provider"
         );
     }

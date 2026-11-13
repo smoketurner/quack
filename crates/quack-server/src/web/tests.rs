@@ -166,11 +166,7 @@ fn when_renders_time_elements_and_escapes_anything_else() {
     let now: Timestamp = "2026-10-01T12:00:00Z"
         .parse()
         .unwrap_or(Timestamp::UNIX_EPOCH);
-    let ago = |at: &str| {
-        Moment::from_utc_text(at)
-            .map(|m| m.ago(now))
-            .unwrap_or_default()
-    };
+    let ago = |at: &str| Moment::from_utc_text(at).map_or_default(|m| m.ago(now));
     assert_eq!(ago("2026-10-01 11:59:30"), "just now");
     assert_eq!(ago("2026-10-01 11:55:00"), "5 min ago");
     assert_eq!(ago("2026-10-01 09:00:00"), "3 h ago");

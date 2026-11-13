@@ -1238,14 +1238,11 @@ async fn documents_list_a_page_at_a_time() {
         ids.push(id);
     }
     let listed = |page: &serde_json::Value| -> Vec<String> {
-        page["documents"]
-            .as_array()
-            .map(|d| {
-                d.iter()
-                    .filter_map(|d| d["id"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
+        page["documents"].as_array().map_or_default(|d| {
+            d.iter()
+                .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                .collect()
+        })
     };
     let (status, first) = h.get(&format!("{base}?limit=2"), &token).await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -1328,8 +1325,7 @@ async fn a_replacement_supersedes_its_predecessor_once_ready() {
     let (_, listed) = h.get(&base, &token).await;
     let ids: Vec<&str> = listed["documents"]
         .as_array()
-        .map(|docs| docs.iter().filter_map(|d| d["id"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|docs| docs.iter().filter_map(|d| d["id"].as_str()).collect());
     assert_eq!(ids, [new.as_str()], "{listed}");
     let ingests = h
         .audit(AuditFilter {
@@ -3086,7 +3082,7 @@ async fn local_mode_refuses_a_host_that_is_not_loopback() {
             router
                 .oneshot(request)
                 .await
-                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|e| match e {})
                 .status()
         }
     };
@@ -3206,10 +3202,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
                 .uri(path)
                 .body(Body::empty())
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            let response = router
-                .oneshot(request)
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()));
+            let response = router.oneshot(request).await.unwrap_or_else(|e| match e {});
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -3222,8 +3215,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
     assert_eq!(status, StatusCode::OK);
     let ids: Vec<&str> = list["workspaces"]
         .as_array()
-        .map(|rows| rows.iter().filter_map(|w| w["id"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|rows| rows.iter().filter_map(|w| w["id"].as_str()).collect());
     assert_eq!(ids, vec![mine.as_str()], "{list}");
     let (status, _) = get(format!("/api/v1/workspaces/{mine}/tables")).await;
     assert_eq!(status, StatusCode::OK);
@@ -3242,7 +3234,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
         .clone()
         .oneshot(request)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -3270,10 +3262,7 @@ async fn a_session_server_serves_only_the_held_workspace() {
         .uri("/workspaces")
         .body(Body::empty())
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let response = router
-        .oneshot(page)
-        .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = router.oneshot(page).await.unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::OK);
     let html = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -3425,8 +3414,7 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
     assert_eq!(body["version"], 9);
     let classes: Vec<&str> = body["classes"]
         .as_array()
-        .map(|c| c.iter().filter_map(|x| x["id"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|c| c.iter().filter_map(|x| x["id"].as_str()).collect());
     assert_eq!(classes, ["order", "vendor"]);
     assert!(
         body["properties"]
@@ -4606,8 +4594,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut names: Vec<&str> = body["result"]["tools"]
         .as_array()
-        .map(|tools| tools.iter().filter_map(|t| t["name"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|tools| tools.iter().filter_map(|t| t["name"].as_str()).collect());
     names.sort_unstable();
     assert_eq!(
         names,
@@ -4724,8 +4711,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     .await;
     let uris: Vec<&str> = body["result"]["resources"]
         .as_array()
-        .map(|r| r.iter().filter_map(|r| r["uri"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|r| r.iter().filter_map(|r| r["uri"].as_str()).collect());
     assert!(
         uris.contains(&"quack://workspace/tables/t/schema"),
         "{body}"
@@ -5275,8 +5261,7 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
     assert_eq!(status, StatusCode::OK, "{body}");
     let labels: Vec<&str> = body["nodes"]
         .as_array()
-        .map(|n| n.iter().filter_map(|n| n["label"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|n| n.iter().filter_map(|n| n["label"].as_str()).collect());
     assert!(
         labels.contains(&"Kenya") && labels.contains(&"PO-1") && labels.contains(&"PO-3"),
         "{labels:?}"
@@ -5775,7 +5760,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         .clone()
         .oneshot(request)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
@@ -5845,8 +5830,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         .files
         .iter()
         .find(|f| f.path == "log.md")
-        .map(|f| f.content.clone())
-        .unwrap_or_default();
+        .map_or_default(|f| f.content.clone());
     assert!(
         !log.contains("Activity"),
         "no audit detail in a bundle: {log}"
@@ -5980,14 +5964,11 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
     let (_, body) = h
         .get(&format!("/api/v1/workspaces/{ws2}/ontology/candidates"), "")
         .await;
-    let ids: Vec<&str> = body["candidates"]
-        .as_array()
-        .map(|c| {
-            c.iter()
-                .filter_map(|c| c["proposal"]["id"].as_str())
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<&str> = body["candidates"].as_array().map_or_default(|c| {
+        c.iter()
+            .filter_map(|c| c["proposal"]["id"].as_str())
+            .collect()
+    });
     assert!(
         ids.contains(&"vendor") && ids.contains(&"vendor_links_country"),
         "{ids:?}"
@@ -6977,14 +6958,11 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
         .unwrap_or_else(|e| fail(&e.to_string()));
     let (status, body, _) = h.send(request).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    let ids: Vec<String> = body["documents"]
-        .as_array()
-        .map(|docs| {
-            docs.iter()
-                .filter_map(|d| d["id"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<String> = body["documents"].as_array().map_or_default(|docs| {
+        docs.iter()
+            .filter_map(|d| d["id"].as_str().map(str::to_owned))
+            .collect()
+    });
     assert_eq!(ids.len(), files);
     for id in &ids {
         let ready = h.wait_ready(&ws, id, &token).await;
@@ -7054,7 +7032,7 @@ async fn the_jobs_page_follows_the_job_stream_with_the_session_cookie() {
         .clone()
         .oneshot(request)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
         response
@@ -7388,7 +7366,7 @@ async fn the_jobs_stream_ends_when_the_server_begins_to_stop() {
         .clone()
         .oneshot(request)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::OK);
 
     h.app.engine.stop_jobs(std::time::Duration::ZERO).await;
@@ -7575,15 +7553,12 @@ async fn a_stopping_server_cancels_an_mcp_query_turn_on_the_record() {
     let mut queries = Vec::new();
     for _ in 0..250 {
         let (_, recorded) = h.get(&format!("{sessions}/{sid}"), &token).await;
-        contents = recorded["messages"]
-            .as_array()
-            .map(|messages| {
-                messages
-                    .iter()
-                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
+        contents = recorded["messages"].as_array().map_or_default(|messages| {
+            messages
+                .iter()
+                .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                .collect()
+        });
         queries = h
             .audit(AuditFilter {
                 workspace_id: Some(ws.clone()),
@@ -9652,8 +9627,7 @@ async fn a_person_edits_graph_nodes_and_edges_over_the_api_and_the_page() {
         .await;
     let asserted: Vec<&serde_json::Value> = body["provenance"]
         .as_array()
-        .map(|p| p.iter().filter(|p| p["asserted_at"].is_string()).collect())
-        .unwrap_or_default();
+        .map_or_default(|p| p.iter().filter(|p| p["asserted_at"].is_string()).collect());
     assert_eq!(asserted.len(), 2, "{body}");
     assert!(asserted.iter().all(|p| p["author"].is_string()), "{body}");
     assert!(
@@ -9792,10 +9766,7 @@ async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let h = h.router.clone();
         async move {
-            let response = h
-                .oneshot(request)
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()));
+            let response = h.oneshot(request).await.unwrap_or_else(|e| match e {});
             let status = response.status();
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -10611,7 +10582,7 @@ async fn readiness_and_metrics_are_served_outside_the_limiter() {
         .clone()
         .oneshot(request)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::OK);
     let text = String::from_utf8(
         axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -10980,14 +10951,11 @@ async fn rest_search_scopes_explains_and_is_audited() {
     let token = h.login("owner").await;
     let path = format!("/api/v1/workspaces/{ws}/search");
     let documents = |body: &serde_json::Value| -> Vec<String> {
-        body["chunks"]
-            .as_array()
-            .map(|c| {
-                c.iter()
-                    .filter_map(|c| c["filename"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
+        body["chunks"].as_array().map_or_default(|c| {
+            c.iter()
+                .filter_map(|c| c["filename"].as_str().map(str::to_owned))
+                .collect()
+        })
     };
 
     let (status, body) = h
@@ -11331,7 +11299,7 @@ async fn the_graph_exports_as_a_download_audited_with_its_counts() {
         .clone()
         .oneshot(request)
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(response.status(), StatusCode::OK);
     let header_of = |name| {
         response
@@ -11787,8 +11755,7 @@ async fn other_questions_label_every_row_again_and_the_labels_serve_until_then()
     let table = l.described("tickets_labels").await;
     let names: Vec<&str> = table["columns"]
         .as_array()
-        .map(|c| c.iter().filter_map(|c| c["name"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|c| c.iter().filter_map(|c| c["name"].as_str()).collect());
     assert!(!names.contains(&"department"), "{names:?}");
     assert!(names.contains(&"churn"), "{names:?}");
 }

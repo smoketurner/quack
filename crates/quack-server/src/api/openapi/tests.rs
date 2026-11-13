@@ -116,17 +116,12 @@ async fn every_method_the_router_answers_is_documented() {
     let router = routes.into_router().with_state(Arc::clone(&app));
     let doc = openapi();
     for path in paths {
-        let documented: BTreeSet<&str> = doc
-            .paths
-            .paths
-            .get(path)
-            .map(|item| {
-                Endpoint::operations(item)
-                    .into_iter()
-                    .map(|(method, _)| method)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let documented: BTreeSet<&str> = doc.paths.paths.get(path).map_or_default(|item| {
+            Endpoint::operations(item)
+                .into_iter()
+                .map(|(method, _)| method)
+                .collect()
+        });
         for method in [
             Method::GET,
             Method::POST,
@@ -143,7 +138,7 @@ async fn every_method_the_router_answers_is_documented() {
                 .clone()
                 .oneshot(request)
                 .await
-                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|e| match e {})
                 .status();
             let routed = status != StatusCode::METHOD_NOT_ALLOWED;
             assert_eq!(
@@ -401,7 +396,7 @@ async fn the_document_and_its_page_are_served_to_anyone() {
                     .unwrap_or_else(|e| fail(&e.to_string())),
             )
             .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+            .unwrap_or_else(|e| match e {});
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let headers = response.headers();
         assert_eq!(
@@ -442,6 +437,6 @@ async fn the_document_and_its_page_are_served_to_anyone() {
                 .unwrap_or_else(|e| fail(&e.to_string())),
         )
         .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     assert_eq!(viewer.status(), StatusCode::OK);
 }

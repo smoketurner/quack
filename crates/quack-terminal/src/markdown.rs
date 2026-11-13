@@ -459,11 +459,7 @@ impl Renderer {
                 // The row's prefix comes out of the table's width.
                 let indent = self.prefix_width();
                 let width = self.width.saturating_sub(indent);
-                let rows = self
-                    .table
-                    .take()
-                    .map(|table| table.rows(width))
-                    .unwrap_or_default();
+                let rows = self.table.take().map_or_default(|table| table.rows(width));
                 for row in rows {
                     self.current = row;
                     self.end_row();
@@ -530,8 +526,7 @@ mod tests {
         let style_of = |row: usize, span: usize| {
             rows.get(row)
                 .and_then(|r| r.get(span))
-                .map(|s| s.style)
-                .unwrap_or_default()
+                .map_or_default(|s| s.style)
         };
         assert!(style_of(0, 0).add_modifier.contains(Modifier::BOLD));
         assert!(style_of(2, 1).add_modifier.contains(Modifier::BOLD));

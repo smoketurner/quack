@@ -494,8 +494,7 @@ async fn history_keeps_the_newest_finished_jobs() {
     assert_eq!(
         listed
             .first()
-            .map(|j| j.id.to_string())
-            .unwrap_or_default()
+            .map_or_default(|j| j.id.to_string())
             .parse::<JobId>()
             .ok(),
         listed.first().map(|j| j.id)

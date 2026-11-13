@@ -385,8 +385,7 @@ impl When {
         Moment::from_utc_text(text).map_or_else(
             || {
                 askama::filters::escape(text, askama::filters::Html)
-                    .map(|e| e.to_string())
-                    .unwrap_or_default()
+                    .map_or_default(|e| e.to_string())
             },
             |at| self.element(&at),
         )
@@ -645,19 +644,17 @@ impl TableView {
                     meaning: c
                         .meaning
                         .as_ref()
-                        .map(|m| m.to_string().trim_start_matches(": ").to_owned())
-                        .unwrap_or_default(),
+                        .map_or_default(|m| m.to_string().trim_start_matches(": ").to_owned()),
                     present: match (counts, profile) {
                         (Some(counts), Some(p)) => {
                             Share::of(counts.non_null, p.row_count).to_string()
                         }
                         _ => String::new(),
                     },
-                    distinct: counts.map(|c| c.distinct.to_string()).unwrap_or_default(),
+                    distinct: counts.map_or_default(|c| c.distinct.to_string()),
                     range: counts
                         .and_then(|c| c.range.as_ref())
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
+                        .map_or_default(ToString::to_string),
                     warnings: flagged.iter().map(|f| f.warning.to_string()).collect(),
                     fix: flagged
                         .iter()
@@ -1355,8 +1352,7 @@ impl MessageView {
             at: Moment::from_utc_text(&row.created_at),
             duration_ms: None,
             content_html: askama::filters::escape(&row.content, askama::filters::Html)
-                .map(|e| e.to_string())
-                .unwrap_or_default(),
+                .map_or_default(|e| e.to_string()),
             steps: Vec::new(),
             citations: Vec::new(),
             chart_json: None,
@@ -1615,7 +1611,7 @@ impl JobRows {
                     j.state.to_string()
                 },
                 active: !j.state.is_finished(),
-                progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
+                progress: j.progress.map_or_default(|p| p.to_string()),
                 outcome: j.outcome.or(j.status),
                 queued_at: Moment(j.queued_at),
             })
@@ -2273,7 +2269,7 @@ async fn ontology_page(
     };
     html(&OntologyPage {
         page: Page::in_workspace(&app, Tab::Ontology, &access),
-        classes: ontology.as_ref().map(ClassRow::tree).unwrap_or_default(),
+        classes: ontology.as_ref().map_or_default(ClassRow::tree),
         ontology,
         json,
         versions,
@@ -2332,26 +2328,25 @@ impl CandidateView {
         let examples = e
             .get("examples")
             .and_then(|x| x.as_array())
-            .map(|xs| {
+            .map_or_default(|xs| {
                 xs.iter()
                     .filter_map(|x| x.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            })
-            .unwrap_or_default();
+            });
         format!(
             "{} bundle files · e.g. {examples}",
-            e.get("files").map(ToString::to_string).unwrap_or_default()
+            e.get("files").map_or_default(ToString::to_string)
         )
     }
 
     /// "N mentions in M documents, e.g. ..." for a document-evidence candidate.
     fn document_evidence(e: &serde_json::Value) -> String {
-        let get = |k: &str| e.get(k).map(ToString::to_string).unwrap_or_default();
+        let get = |k: &str| e.get(k).map_or_default(ToString::to_string);
         let examples = e
             .get("examples")
             .and_then(|x| x.as_array())
-            .map(|xs| {
+            .map_or_default(|xs| {
                 xs.iter()
                     .filter_map(|x| {
                         x.get("mention")
@@ -2361,8 +2356,7 @@ impl CandidateView {
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
-            })
-            .unwrap_or_default();
+            });
         format!(
             "{} mentions in {} documents · e.g. {examples}",
             get("occurrences"),
@@ -2373,12 +2367,10 @@ impl CandidateView {
     fn from_row(c: candidates::CandidateRow) -> Self {
         let e = &c.evidence;
         let get = |k: &str| {
-            e.get(k)
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default()
+            e.get(k).map_or_default(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
         };
         let source = e.get("source").and_then(|v| v.as_str());
         let from_documents = source == Some("documents");
@@ -2691,10 +2683,7 @@ async fn context_page(
         .await?;
     html(&ContextPage {
         page: Page::in_workspace(&app, Tab::Context, &access),
-        content: current
-            .as_ref()
-            .map(|c| c.content.clone())
-            .unwrap_or_default(),
+        content: current.as_ref().map_or_default(|c| c.content.clone()),
         current,
         versions,
     })
@@ -3064,10 +3053,7 @@ async fn admin_audit(
         action: filter.action.unwrap_or_default(),
         outcome: filter.outcome,
         outcomes: Outcome::ALL,
-        workspace_id: filter
-            .workspace_id
-            .map(WorkspaceId::into_string)
-            .unwrap_or_default(),
+        workspace_id: filter.workspace_id.map_or_default(WorkspaceId::into_string),
     })
 }
 

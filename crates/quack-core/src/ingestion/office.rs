@@ -164,7 +164,7 @@ fn slides(package: &Package, kind: &str) -> Result<Extracted> {
             }
             let text = text.trim();
             if !text.is_empty() {
-                body.push(Section::note(heading.clone(), text));
+                body.push(Section::note(heading, text));
             }
         }
         for section in body {
@@ -562,8 +562,7 @@ pub(crate) mod tests {
         let bytes = docx_package(false);
         let refused = docx(&bytes, DecompressionBudget::megabytes(0))
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(refused.contains("max_decompressed_mb"), "{refused}");
     }
 

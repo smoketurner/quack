@@ -78,10 +78,7 @@ struct IssuerState {
 type Issuer = Arc<Mutex<IssuerState>>;
 
 async fn discovery(State(issuer): State<Issuer>) -> Json<Value> {
-    let (base, par) = issuer
-        .lock()
-        .map(|s| (s.base.clone(), s.par))
-        .unwrap_or_default();
+    let (base, par) = issuer.lock().map_or_default(|s| (s.base.clone(), s.par));
     let mut metadata = json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
@@ -108,7 +105,7 @@ async fn par(
 }
 
 async fn jwks(State(issuer): State<Issuer>) -> Json<Value> {
-    let keys = issuer.lock().map(|s| s.jwks.clone()).unwrap_or_default();
+    let keys = issuer.lock().map_or_default(|s| s.jwks.clone());
     Json(json!({ "keys": keys }))
 }
 
@@ -249,7 +246,7 @@ impl Harness {
         change: impl FnOnce(&mut OidcConfig),
     ) -> Self {
         let issuer = start_issuer().await;
-        let base = issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+        let base = issuer.lock().map_or_default(|s| s.base.clone());
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = Config::default();
         config.general.data_dir = dir.path().to_path_buf();
@@ -344,7 +341,7 @@ impl Harness {
             .clone()
             .oneshot(request)
             .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+            .unwrap_or_else(|e| match e {});
         let status = response.status();
         let header_text = |name| {
             response
@@ -379,8 +376,7 @@ impl Harness {
             .parse::<axum::http::Uri>()
             .ok()
             .and_then(|uri| axum::extract::Query::try_from_uri(&uri).ok())
-            .map(|axum::extract::Query(q)| q)
-            .unwrap_or_default();
+            .map_or_default(|axum::extract::Query(q)| q);
         let cookie = reply
             .cookie(super::STATE_COOKIE)
             .unwrap_or_else(|| fail("no state cookie"));
@@ -399,11 +395,7 @@ impl Harness {
     /// Sign `subject` in as `username`; the session cookie on success.
     async fn sign_in(&self, subject: &str, username: &str) -> String {
         let (state, nonce, cookie) = self.start().await;
-        let base = self
-            .issuer
-            .lock()
-            .map(|s| s.base.clone())
-            .unwrap_or_default();
+        let base = self.issuer.lock().map_or_default(|s| s.base.clone());
         self.issuer(|s| {
             s.id_claims = json!({
                 "iss": base, "sub": subject, "aud": "quack",
@@ -443,13 +435,12 @@ impl Harness {
             .control
             .query_audit(&filter)
             .await
-            .map(|page| {
+            .map_or_default(|page| {
                 page.rows
                     .into_iter()
                     .map(|r| (r.entry.outcome, r.entry.user_id))
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     /// Whether the user's sealed token is in `control.db`.
@@ -481,11 +472,7 @@ impl Harness {
     /// A callback for a fresh subject, which the handler answers.
     async fn sign_in_reply(&self, subject: &str) -> Reply {
         let (state, nonce, cookie) = self.start().await;
-        let base = self
-            .issuer
-            .lock()
-            .map(|s| s.base.clone())
-            .unwrap_or_default();
+        let base = self.issuer.lock().map_or_default(|s| s.base.clone());
         self.issuer(|s| {
             s.id_claims = json!({
                 "iss": base, "sub": subject, "aud": "quack",
@@ -649,7 +636,7 @@ async fn an_expiring_sign_in_is_renewed_and_a_revoked_one_ends_every_session() {
     h.issuer(|s| s.lifetime = 30);
     let first = h.sign_in("sub-grace", "grace").await;
     let second = h.sign_in("sub-grace", "grace").await;
-    let refreshes = || h.issuer.lock().map(|s| s.refreshes).unwrap_or_default();
+    let refreshes = || h.issuer.lock().map_or_default(|s| s.refreshes);
 
     assert_eq!(h.me(&first).await.0, StatusCode::OK);
     assert_eq!(refreshes(), 1);
@@ -721,7 +708,7 @@ async fn a_renewal_reconciles_groups_and_a_changed_subject_ends_the_sign_in() {
             .find(|m| m.username == "ada")
             .map(|m| m.role)
     };
-    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    let base = h.issuer.lock().map_or_default(|s| s.base.clone());
     let renewed_as = |subject: &str| {
         json!({
             "iss": base, "sub": subject, "aud": "quack",
@@ -763,7 +750,7 @@ async fn an_unreachable_issuer_keeps_the_session_and_asks_again_later() {
     assert_eq!(h.me(&session).await.0, StatusCode::OK);
     assert_eq!(h.me(&session).await.0, StatusCode::OK);
     // One attempt, then the retry delay holds off the next.
-    assert_eq!(h.issuer.lock().map(|s| s.refreshes).unwrap_or_default(), 1);
+    assert_eq!(h.issuer.lock().map_or_default(|s| s.refreshes), 1);
 }
 
 #[tokio::test]
@@ -934,7 +921,7 @@ async fn without_oidc_there_is_no_button_and_no_route() {
                     .unwrap_or_else(|e| fail(&e.to_string())),
             )
             .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+            .unwrap_or_else(|e| match e {});
         assert_eq!(response.status(), status, "{uri}");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -997,7 +984,7 @@ impl Harness {
     async fn resource() -> (Self, IssuerKey, String) {
         let h = Self::with_audience(Some(AUDIENCE)).await;
         let key = IssuerKey::new();
-        let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+        let base = h.issuer.lock().map_or_default(|s| s.base.clone());
         h.issuer(|s| s.jwks = vec![key.jwk.clone()]);
         (h, key, base)
     }
@@ -1130,7 +1117,7 @@ async fn the_metadata_names_each_resource_and_its_issuer() {
 async fn without_an_audience_nothing_is_published_or_accepted() {
     let h = Harness::new().await;
     let key = IssuerKey::new();
-    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    let base = h.issuer.lock().map_or_default(|s| s.base.clone());
     h.issuer(|s| s.jwks = vec![key.jwk.clone()]);
 
     let metadata = h.get("/.well-known/oauth-protected-resource", None).await;
@@ -1224,8 +1211,7 @@ fn obo_manager(app: &App, auth: ClientAuth) -> Result<TokenManager, ApiError> {
         .server
         .oidc
         .as_ref()
-        .map(|o| o.issuer_url.clone())
-        .unwrap_or_default();
+        .map_or_default(|o| o.issuer_url.clone());
     let oauth = OAuthConfig {
         issuer_url: issuer,
         client_id: Some(String::from("quack")),
@@ -1292,10 +1278,7 @@ impl Harness {
             .header(credential.0, credential.1)
             .body(Body::empty())
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let response = router
-            .oneshot(request)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let response = router.oneshot(request).await.unwrap_or_else(|e| match e {});
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1410,7 +1393,7 @@ async fn an_https_public_url_makes_loopback_cookies_secure() {
         .and_then(|uri| axum::extract::Query::<HashMap<String, String>>::try_from_uri(&uri).ok())
         .and_then(|axum::extract::Query(q)| q.get("nonce").cloned())
         .unwrap_or_default();
-    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    let base = h.issuer.lock().map_or_default(|s| s.base.clone());
     h.issuer(|s| {
         s.id_claims = json!({
             "iss": base, "sub": "sub-ada", "aud": "quack",
@@ -1512,23 +1495,18 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
     })
     .await;
     h.issuer(|s| s.par = true);
-    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    let base = h.issuer.lock().map_or_default(|s| s.base.clone());
 
     // Out: the browser carries only a reference to the pushed request.
     let reply = h.get(OidcConfig::START_PATH, None).await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
     let location: axum::http::Uri = reply.location.parse().unwrap_or_else(|_| fail("location"));
-    let query: HashMap<String, String> = axum::extract::Query::try_from_uri(&location)
-        .map(|axum::extract::Query(q)| q)
-        .unwrap_or_default();
+    let query: HashMap<String, String> =
+        axum::extract::Query::try_from_uri(&location).map_or_default(|axum::extract::Query(q)| q);
     assert_eq!(query.len(), 2, "{}", reply.location);
     assert_eq!(query.get("client_id").map(String::as_str), Some("quack"));
     assert!(query.contains_key("request_uri"));
-    let pushed = h
-        .issuer
-        .lock()
-        .map(|s| s.pushed.clone())
-        .unwrap_or_default();
+    let pushed = h.issuer.lock().map_or_default(|s| s.pushed.clone());
     let [pushed] = pushed.as_slice() else {
         fail(&format!("{pushed:?}"));
     };
@@ -1584,11 +1562,7 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
     assert_eq!(obo.status, StatusCode::OK, "{}", obo.body);
     assert_eq!(obo.body, "obo-user-access");
 
-    let requests = h
-        .issuer
-        .lock()
-        .map(|s| s.token_requests.clone())
-        .unwrap_or_default();
+    let requests = h.issuer.lock().map_or_default(|s| s.token_requests.clone());
     let grants: Vec<&str> = requests
         .iter()
         .filter_map(|(form, _)| form.get("grant_type").map(String::as_str))
@@ -1754,7 +1728,7 @@ async fn a_renewal_and_an_exchange_meeting_one_refusal_record_it_once() {
         1,
         "{rows:?}"
     );
-    assert_eq!(h.issuer.lock().map(|s| s.refreshes).unwrap_or_default(), 1);
+    assert_eq!(h.issuer.lock().map_or_default(|s| s.refreshes), 1);
 }
 
 #[tokio::test]

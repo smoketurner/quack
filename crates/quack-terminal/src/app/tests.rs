@@ -631,10 +631,10 @@ fn rows_of(buffer: &Buffer) -> Vec<String> {
 /// The rows of a frame drawn 80 columns by 30 rows.
 fn screen(app: &App) -> Vec<String> {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30))
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     terminal
         .draw(|frame| ui::draw(frame, app))
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .unwrap_or_else(|e| match e {});
     rows_of(terminal.backend().buffer())
 }
 
@@ -1030,7 +1030,7 @@ async fn the_event_loop_answers_typed_sql_and_quits_on_ctrl_c() {
     }
     assert!(keys.unbounded_send(press(KeyCode::Enter)).is_ok());
     let mut terminal =
-        ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap_or_else(|e| fail(&e.to_string()));
+        ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap_or_else(|e| match e {});
     let running = tokio::spawn(async move {
         let result = app
             .run_with(&mut terminal, input, Clipboard::terminal_only(Vec::new()))
@@ -1501,9 +1501,7 @@ async fn the_command_popup_picks_fills_in_and_runs() {
     assert!(app.completion().is_none());
 
     // The popup's rows: the highlighted one marked, labels aligned.
-    let items = Completion::for_line("/mode ")
-        .map(|c| c.items)
-        .unwrap_or_default();
+    let items = Completion::for_line("/mode ").map_or_default(|c| c.items);
     let popup = |items: &[Suggestion], selected| {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 8));
         (&ui::CompletionPopup::new(items, selected)).render(buffer.area, &mut buffer);
@@ -1521,9 +1519,7 @@ async fn the_command_popup_picks_fills_in_and_runs() {
     );
 
     // More entries than rows: the list scrolls to the highlighted one.
-    let commands = Completion::for_line("/")
-        .map(|c| c.items)
-        .unwrap_or_default();
+    let commands = Completion::for_line("/").map_or_default(|c| c.items);
     assert!(commands.len() > 10, "{}", commands.len());
     let rows = popup(&commands, 10);
     let label = commands.get(10).map_or("", |s| s.label.as_str());
@@ -1538,8 +1534,7 @@ async fn the_command_popup_picks_fills_in_and_runs() {
 /// The words the popup offers for the input as it stands.
 fn offered(app: &App) -> Vec<String> {
     app.completion()
-        .map(|c| c.items.into_iter().map(|s| s.word).collect())
-        .unwrap_or_default()
+        .map_or_default(|c| c.items.into_iter().map(|s| s.word).collect())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2343,7 +2338,7 @@ async fn the_event_loop_highlights_a_selection_and_copies_it() {
     // The stream's end stops the loop.
     drop(events);
     let mut terminal =
-        ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap_or_else(|e| fail(&e.to_string()));
+        ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap_or_else(|e| match e {});
     let mut sent = Vec::new();
     let result = app
         .run_with(&mut terminal, input, Clipboard::terminal_only(&mut sent))

@@ -310,11 +310,7 @@ fn a_class_named_like_the_edge_view_is_refused() {
         .unwrap_or_else(|| fail("a class"));
     class.id = ClassId::from("edges");
     ontology.classes.push(class);
-    let error = ontology
-        .validate()
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    let error = ontology.validate().err().map_or_default(|e| e.to_string());
     assert!(
         error.contains("taken by the graph's edge view (graph_edges)"),
         "{error}"

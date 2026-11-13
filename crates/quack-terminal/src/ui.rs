@@ -124,7 +124,7 @@ impl JobRow<'_> {
     /// progress, then its latest status and how it ended.
     pub(crate) fn details(&self) -> String {
         let job = self.0;
-        let progress = job.progress.map(|p| format!(" {p}")).unwrap_or_default();
+        let progress = job.progress.map_or_default(|p| format!(" {p}"));
         let mut text = format!(
             "Job #{} {} {} {}{progress}",
             job.number, job.state, job.kind, job.label

@@ -320,12 +320,11 @@ fn registered_key(metadata: &serde_json::Value, state: &MockState) {
         .get("jwks")
         .and_then(|jwks| jwks.get("keys"))
         .and_then(serde_json::Value::as_array)
-        .map(|keys| {
+        .map_or_default(|keys| {
             keys.iter()
                 .filter_map(|key| serde_json::from_value::<PublicJwk>(key.clone()).ok())
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     if let Ok(mut registered) = state.client_jwk.lock() {
         *registered = jwks;
     }
@@ -754,8 +753,7 @@ async fn expiring_token_is_refreshed_once_under_concurrency() {
         .state
         .last_token_body
         .lock()
-        .map(|b| b.clone())
-        .unwrap_or_default();
+        .map_or_default(|b| b.clone());
     assert!(body.contains("client_id=client-1"), "{body}");
 }
 
@@ -941,8 +939,7 @@ async fn client_credentials_needs_no_login_and_runs_again_when_the_token_runs_ou
         .state
         .last_token_body
         .lock()
-        .map(|b| b.clone())
-        .unwrap_or_default();
+        .map_or_default(|b| b.clone());
     assert!(body.contains("client_id=client-1"), "{body}");
     assert!(body.contains("scope=api"), "{body}");
     assert!(
@@ -1214,8 +1211,7 @@ fn last_body(idp: &MockIdp) -> String {
     idp.state
         .last_token_body
         .lock()
-        .map(|b| b.clone())
-        .unwrap_or_default()
+        .map_or_default(|b| b.clone())
 }
 
 #[tokio::test]
@@ -1314,8 +1310,7 @@ async fn entras_form_sends_the_assertion_and_no_actor_and_basic_auth_uses_the_he
         .state
         .last_token_auth
         .lock()
-        .map(|a| a.clone())
-        .unwrap_or_default();
+        .map_or_default(|a| a.clone());
     let expected = base64::engine::general_purpose::STANDARD
         .encode(format!("client-1:{}", env!("CARGO_PKG_NAME")));
     assert_eq!(auth, format!("Basic {expected}"));
@@ -1445,23 +1440,21 @@ fn with_key(mut config: OAuthConfig) -> OAuthConfig {
 }
 
 fn spent(idp: &MockIdp) -> usize {
-    idp.state.spent.lock().map(|s| s.len()).unwrap_or_default()
+    idp.state.spent.lock().map_or_default(|s| s.len())
 }
 
 fn refused(idp: &MockIdp) -> Vec<String> {
     idp.state
         .refused_assertions
         .lock()
-        .map(|r| r.clone())
-        .unwrap_or_default()
+        .map_or_default(|r| r.clone())
 }
 
 fn last_auth(idp: &MockIdp) -> String {
     idp.state
         .last_token_auth
         .lock()
-        .map(|a| a.clone())
-        .unwrap_or_default()
+        .map_or_default(|a| a.clone())
 }
 
 #[tokio::test]
@@ -1601,12 +1594,7 @@ async fn a_browser_login_pushes_its_request_and_signs_the_code_exchange() {
     assert_eq!(q.len(), 2, "{url}");
     assert_eq!(q.get("client_id").map(String::as_str), Some("client-1"));
     assert!(q.contains_key("request_uri"));
-    let pushed = idp
-        .state
-        .par_bodies
-        .lock()
-        .map(|b| b.clone())
-        .unwrap_or_default();
+    let pushed = idp.state.par_bodies.lock().map_or_default(|b| b.clone());
     let [pushed] = pushed.as_slice() else {
         fail(&format!("{pushed:?}"));
     };

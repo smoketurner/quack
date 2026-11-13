@@ -435,7 +435,7 @@ pub(crate) async fn propose(
     body: Option<Json<ProposeRequest>>,
 ) -> ApiResult<(StatusCode, Json<Proposed>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let request = body.map(|b| b.0).unwrap_or_default();
+    let request = body.map_or_default(|b| b.0);
     if let Some(mode) = request.mode.as_deref()
         && mode != "extend"
     {
