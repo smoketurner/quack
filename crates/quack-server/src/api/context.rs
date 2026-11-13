@@ -48,7 +48,7 @@ pub(crate) async fn show(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/markdown"));
     if wants_markdown {
-        let body = current.map(|c| c.content).unwrap_or_default();
+        let body = current.map_or_default(|c| c.content);
         return Ok((
             [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
             body,

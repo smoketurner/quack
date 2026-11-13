@@ -1089,7 +1089,7 @@ mod tests {
         let is_table = |s: &&Section| s.kind == super::super::parser::SectionKind::Table;
         let tables: Vec<&Section> = extracted.sections.iter().filter(is_table).collect();
         assert_eq!(tables.len(), 1, "{:?}", extracted.sections);
-        let table = tables.first().map(|s| s.text.as_str()).unwrap_or_default();
+        let table = tables.first().map_or_default(|s| s.text.as_str());
         assert!(table.starts_with("| Region | Jul | Aug | Sep |"), "{table}");
         assert!(table.contains("| West | 480 | 401 | 362 |"), "{table}");
         let body: String = extracted
@@ -1160,13 +1160,11 @@ mod tests {
     fn a_pdf_whose_every_page_fails_or_is_blank_says_which() {
         let failed = Pages::read(3, |_| Err(String::from("bad")))
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(failed.contains("3 of 3 pages failed"), "{failed}");
         let blank = Pages::read(2, |_| Ok(PageContent::default()))
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(blank.contains("no text layer"), "{blank}");
     }
 }

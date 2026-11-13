@@ -116,17 +116,12 @@ async fn every_method_the_router_answers_is_documented() {
     let router = routes.into_router().with_state(Arc::clone(&app));
     let doc = openapi();
     for path in paths {
-        let documented: BTreeSet<&str> = doc
-            .paths
-            .paths
-            .get(path)
-            .map(|item| {
-                Endpoint::operations(item)
-                    .into_iter()
-                    .map(|(method, _)| method)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let documented: BTreeSet<&str> = doc.paths.paths.get(path).map_or_default(|item| {
+            Endpoint::operations(item)
+                .into_iter()
+                .map(|(method, _)| method)
+                .collect()
+        });
         for method in [
             Method::GET,
             Method::POST,
@@ -139,12 +134,8 @@ async fn every_method_the_router_answers_is_documented() {
                 .uri(concrete(path))
                 .body(Body::empty())
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            let status = router
-                .clone()
-                .oneshot(request)
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .status();
+            let Ok(response) = router.clone().oneshot(request).await;
+            let status = response.status();
             let routed = status != StatusCode::METHOD_NOT_ALLOWED;
             assert_eq!(
                 routed,
@@ -393,15 +384,14 @@ async fn the_document_and_its_page_are_served_to_anyone() {
         (DOCUMENT_PATH, "application/json"),
         (PAGE_PATH, "text/html"),
     ] {
-        let response = router
+        let Ok(response) = router
             .clone()
             .oneshot(
                 Request::get(path)
                     .body(Body::empty())
                     .unwrap_or_else(|e| fail(&e.to_string())),
             )
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+            .await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let headers = response.headers();
         assert_eq!(
@@ -435,13 +425,12 @@ async fn the_document_and_its_page_are_served_to_anyone() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(page.rows.is_empty(), "{:?}", page.rows);
-    let viewer = router
+    let Ok(viewer) = router
         .oneshot(
             Request::get("/static/js/redoc.standalone.js")
                 .body(Body::empty())
                 .unwrap_or_else(|e| fail(&e.to_string())),
         )
-        .await
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        .await;
     assert_eq!(viewer.status(), StatusCode::OK);
 }

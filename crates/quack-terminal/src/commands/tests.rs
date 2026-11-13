@@ -8,9 +8,7 @@ fn fail(msg: &str) -> ! {
 }
 
 fn words(line: &str) -> Vec<String> {
-    Completion::for_line(line)
-        .map(|c| c.items.into_iter().map(|s| s.word).collect())
-        .unwrap_or_default()
+    Completion::for_line(line).map_or_default(|c| c.items.into_iter().map(|s| s.word).collect())
 }
 
 fn parses(line: &str) -> bool {

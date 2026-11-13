@@ -188,8 +188,7 @@ fn export_carries_ids_resolved_links_the_ontology_and_no_audit() {
         .files
         .iter()
         .find(|f| f.path == "log.md")
-        .map(|f| f.content.clone())
-        .unwrap_or_default();
+        .map_or_default(|f| f.content.clone());
     assert!(
         !log.contains("secret") && !log.contains("Activity"),
         "{log}"
@@ -454,8 +453,7 @@ fn documents_whose_names_share_a_slug_get_their_own_files() {
         .files
         .iter()
         .find(|f| f.path == "entities/harbour/mombasa.md")
-        .map(|f| f.content.clone())
-        .unwrap_or_default();
+        .map_or_default(|f| f.content.clone());
     assert!(
         mombasa.contains("[report.pdf](../../documents/report-pdf-bbbbbb.md)"),
         "{mombasa}"

@@ -34,8 +34,7 @@ fn split(line: &str) -> (String, usize) {
 fn offered(line: &str) -> Vec<String> {
     let (line, cursor) = split(line);
     SqlCompletion::for_sql(&line, cursor, &schema(), &SqlVocabulary::none())
-        .map(|c| c.items.into_iter().map(|s| s.word).collect())
-        .unwrap_or_default()
+        .map_or_default(|c| c.items.into_iter().map(|s| s.word).collect())
 }
 
 #[test]

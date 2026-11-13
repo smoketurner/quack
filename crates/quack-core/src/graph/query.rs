@@ -375,16 +375,14 @@ mod tests {
 
         let err = class("organisation")
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(
             err.contains("no class 'organisation'") && err.contains("organization"),
             "{err}"
         );
         let err = relation("employed_by")
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(
             err.contains("no relation 'employed_by'") && err.contains("works_at"),
             "{err}"

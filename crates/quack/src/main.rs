@@ -2125,7 +2125,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
     }
     if let [prefix, tag] = args.tag.as_slice() {
         let id = find_document(db, prefix)?;
-        let mut tags = db.document(&id)?.map(|d| d.tags).unwrap_or_default();
+        let mut tags = db.document(&id)?.map_or_default(|d| d.tags);
         if !tags.iter().any(|t| t == tag) {
             tags.push(tag.clone());
         }
@@ -2139,7 +2139,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
     }
     if let [prefix, tag] = args.untag.as_slice() {
         let id = find_document(db, prefix)?;
-        let mut tags = db.document(&id)?.map(|d| d.tags).unwrap_or_default();
+        let mut tags = db.document(&id)?.map_or_default(|d| d.tags);
         tags.retain(|t| t != tag);
         db.set_document_fields(
             &id,

@@ -73,16 +73,14 @@ fn registration_requests(idp: &MockIdp) -> Vec<(String, serde_json::Value)> {
     idp.state
         .registration_requests
         .lock()
-        .map(|r| r.clone())
-        .unwrap_or_default()
+        .map_or_default(|r| r.clone())
 }
 
 fn management_requests(idp: &MockIdp) -> Vec<(String, String, String, String)> {
     idp.state
         .management_requests
         .lock()
-        .map(|r| r.clone())
-        .unwrap_or_default()
+        .map_or_default(|r| r.clone())
 }
 
 fn provider_manager(config: &Config, provider: &str) -> TokenManager {
@@ -496,8 +494,7 @@ async fn rotation_puts_both_keys_at_the_issuer_then_the_new_one_alone() {
     let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let registered = registration_requests(&idp)
         .first()
-        .map(|(_, body)| body.clone())
-        .unwrap_or_default();
+        .map_or_default(|(_, body)| body.clone());
     for field in [
         "grant_types",
         "response_types",

@@ -335,8 +335,7 @@ impl Prepared {
         let when = draft
             .approved_at
             .as_deref()
-            .map(|at| at.chars().take(10).collect::<String>())
-            .unwrap_or_default();
+            .map_or_default(|at| at.chars().take(10).collect::<String>());
         match &draft.set.sentence {
             Some(sentence) => format!("Questions approved {when} (\"{sentence}\"):"),
             None => format!("Questions approved {when}:"),
@@ -459,13 +458,11 @@ impl Shown {
         let when = draft
             .approved_at
             .as_deref()
-            .map(|at| at.chars().take(16).collect::<String>())
-            .unwrap_or_default();
+            .map_or_default(|at| at.chars().take(16).collect::<String>());
         let by = draft
             .drafted_by_model
             .as_deref()
-            .map(|model| format!("; drafted by {model}"))
-            .unwrap_or_default();
+            .map_or_default(|model| format!("; drafted by {model}"));
         match &draft.set.sentence {
             Some(sentence) => writeln!(out, "Asked: \"{sentence}\" (approved {when}{by})")?,
             None => writeln!(out, "Approved {when}{by}")?,
@@ -614,8 +611,7 @@ impl ClassifyCommand {
                     run.skipped,
                     run.error
                         .as_deref()
-                        .map(|e| format!(": {e}"))
-                        .unwrap_or_default()
+                        .map_or_default(|e| format!(": {e}"))
                 )
             },
         )

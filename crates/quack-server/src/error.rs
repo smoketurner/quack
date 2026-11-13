@@ -464,8 +464,7 @@ pub(crate) async fn coded_errors(request: Request, next: Next) -> Response {
     let (parts, body) = response.into_parts();
     let text = axum::body::to_bytes(body, FRAMEWORK_MESSAGE_LIMIT)
         .await
-        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
-        .unwrap_or_default();
+        .map_or_default(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
     let message = if text.is_empty() {
         status
             .canonical_reason()
@@ -821,14 +820,13 @@ mod tests {
         router: Router,
         path: &str,
     ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
-        let response = router
+        let Ok(response) = router
             .oneshot(
                 axum::http::Request::get(path)
                     .body(Body::empty())
                     .unwrap_or_else(|e| fail(&e.to_string())),
             )
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+            .await;
         let (parts, body) = response.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX)
             .await

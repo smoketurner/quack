@@ -178,8 +178,7 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
     // search_graph rather than reading an empty document search.
     let tables_only = DocumentSearch::entity_chunks(&db, "Orgenics", None)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         tables_only.contains("only from table rows") && tables_only.contains("search_graph"),
         "{tables_only}"
@@ -188,16 +187,14 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
     // Not in the graph at all, with and without a near label.
     let near = DocumentSearch::entity_chunks(&db, "Acme Corporation", None)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         near.contains("the closest labels are: Acme (organization)"),
         "{near}"
     );
     let nothing = DocumentSearch::entity_chunks(&db, "Helsinki", None)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         nothing.contains("drop the entity argument") && !nothing.contains("closest"),
         "{nothing}"
@@ -1873,7 +1870,7 @@ async fn a_failed_chart_names_the_columns_asked_and_returned() {
             },
         )
         .await;
-    let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+    let message = result.err().map_or_default(|e| e.to_string());
     for expected in [
         "Chart not created",
         "x 'region', y [spend]",
@@ -1883,10 +1880,7 @@ async fn a_failed_chart_names_the_columns_asked_and_returned() {
         assert!(message.contains(expected), "{message}");
     }
     let steps = recorder.steps();
-    let summary = steps
-        .first()
-        .map(|s| s.summary.as_str())
-        .unwrap_or_default();
+    let summary = steps.first().map_or_default(|s| s.summary.as_str());
     assert!(
         summary.starts_with("error: x 'region', y [spend]: "),
         "{summary}"

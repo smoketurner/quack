@@ -219,7 +219,7 @@ fn every_oidc_key_has_a_setting_and_strays_are_named() {
     assert!(inspection.environment.iter().any(|v| v.name == "S"));
 
     let file = "[server.oidc]\nissuer = \"x\"\n".parse::<Table>();
-    let unknown = file.map(|f| UnknownKey::find_in(&f)).unwrap_or_default();
+    let unknown = file.map_or_default(|f| UnknownKey::find_in(&f));
     assert!(
         unknown.iter().any(|u| u.path == "server.oidc.issuer"),
         "{:?}",
@@ -336,7 +336,7 @@ fn model_settings_are_listed_under_the_quoted_model_id() {
 
     let file = "[providers.p]\ntype = \"openai\"\n[providers.p.models.\"m\"]\ntemp = false\n"
         .parse::<Table>();
-    let unknown = file.map(|f| UnknownKey::find_in(&f)).unwrap_or_default();
+    let unknown = file.map_or_default(|f| UnknownKey::find_in(&f));
     let found = unknown
         .iter()
         .find(|u| u.path == "providers.p.models.\"m\".temp")

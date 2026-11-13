@@ -78,8 +78,7 @@ async fn an_s3_get_is_signed_for_s3_with_the_payload_hash() {
         signed
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or_default()
+            .map_or_default(|(_, v)| v.as_str())
     };
     assert_eq!(
         header("x-amz-content-sha256"),

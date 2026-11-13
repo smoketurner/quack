@@ -21,6 +21,15 @@ ignore = [
     # basic-toml is unmaintained with no successor release; askama_derive uses it
     # only to read askama's own config file while templates compile, never input.
     "RUSTSEC-2026-0374",
+    # SQLite before 3.54.0 can return uninitialized page-cache memory when a
+    # database is opened with a crafted sibling -wal file of another page size.
+    # libsqlite3-sys 0.30.1 bundles an affected SQLite, and sqlx 0.9.0 (the
+    # newest release) requires 0.30, so the fixed 0.39 cannot be taken yet.
+    # control.db is quack's own file in the 0700 data directory, but
+    # `quack import sqlite:PATH` opens a file the user names (read-only, which
+    # still reads its -wal), so a crafted pair could put stale process memory
+    # into the imported table. Remove this once sqlx moves to 0.39.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
@@ -41,8 +50,6 @@ allow = [
     "Zlib",
 ]
 exceptions = [
-    # webpki-roots ships Mozilla CA certs; pulled by ureq (build dep of libduckdb-sys).
-    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
     # The FIPS-validated AWS-LC module, used on Linux only (quack-core's
     # target-gated aws-lc-rs "fips" feature). Its sources carry the OpenSSL
     # license because AWS-LC descends from OpenSSL via BoringSSL. That is the
@@ -61,9 +68,7 @@ deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
     { name = "native-tls" },
-    # ring is banned from runtime code, but libduckdb-sys pulls it at build time
-    # via ureq → rustls for downloading DuckDB sources.
-    { name = "ring", wrappers = ["rustls", "rustls-webpki"] },
+    { name = "ring" },
 ]
 
 [sources]

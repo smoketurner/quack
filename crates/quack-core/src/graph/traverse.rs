@@ -307,7 +307,7 @@ pub fn path(
                 continue;
             }
             seen.insert(there.clone());
-            parent.insert(there.clone(), (here, edge.id.clone()));
+            parent.insert(there.clone(), (here, edge.id));
             if there == to.id {
                 found = true;
                 break;

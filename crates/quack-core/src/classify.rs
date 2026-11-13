@@ -175,8 +175,7 @@ impl Estimate {
         let mut chars = words.chars();
         chars
             .next()
-            .map(|first| first.to_uppercase().chain(chars).collect())
-            .unwrap_or_default()
+            .map_or_default(|first| first.to_uppercase().chain(chars).collect())
     }
 }
 
@@ -281,8 +280,7 @@ impl Outline {
     pub fn statement(&self, model: &str) -> String {
         let estimate = self
             .estimate()
-            .map(|estimate| format!(", {estimate}"))
-            .unwrap_or_default();
+            .map_or_default(|estimate| format!(", {estimate}"));
         let mut lines = vec![
             format!(
                 "-- label {} rows of {} into {} ({}) with {model}, {} questions{estimate}",
@@ -297,8 +295,7 @@ impl Outline {
                 OneLine(&self.key_column),
                 self.key_reason
                     .note()
-                    .map(|note| format!(" ({note})"))
-                    .unwrap_or_default(),
+                    .map_or_default(|note| format!(" ({note})")),
                 self.text_columns
                     .iter()
                     .map(|c| OneLine(c).to_string())
@@ -632,8 +629,7 @@ impl Run {
     #[must_use]
     pub fn column_meanings(&self) -> Vec<(String, String)> {
         columns::OutputColumns::new(&self.source_table, &self.key_column, &self.questions)
-            .map(|columns| columns.meanings())
-            .unwrap_or_default()
+            .map_or_default(|columns| columns.meanings())
     }
 
     /// The set this run ran under.

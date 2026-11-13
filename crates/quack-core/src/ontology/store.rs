@@ -682,10 +682,7 @@ pub fn restore(
 pub fn rename(db: &WorkspaceDb, renames: &IdRenames, author: Option<&str>) -> Result<Ontology> {
     let ontology =
         current(db)?.ok_or_else(|| Error::Ontology(String::from("no ontology to rename in")))?;
-    let acceptance = versions(db, 1)?
-        .first()
-        .map(|v| v.acceptance)
-        .unwrap_or_default();
+    let acceptance = versions(db, 1)?.first().map_or_default(|v| v.acceptance);
     save(
         db,
         &ontology,

@@ -127,7 +127,7 @@ mod tests {
         let mut budget = DecompressionBudget::megabytes(1);
         let read = budget.reader(over.as_slice()).read_to_end(&mut Vec::new());
         assert!(read.is_err());
-        let refusal = budget.refusal().map(|e| e.to_string()).unwrap_or_default();
+        let refusal = budget.refusal().map_or_default(|e| e.to_string());
         assert!(
             refusal.contains("[ingestion].max_decompressed_mb (1 MB)"),
             "{refusal}"
@@ -172,8 +172,7 @@ mod tests {
         let refused = DecompressionBudget::megabytes(1)
             .admit_zip(&bomb)
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(refused.contains("max_decompressed_mb"), "{refused}");
         assert!(DecompressionBudget::megabytes(2).admit_zip(&bomb).is_ok());
     }

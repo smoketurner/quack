@@ -31,31 +31,28 @@ impl CandidateRow {
     pub fn evidence_line(&self) -> String {
         let e = &self.evidence;
         let get = |k: &str| {
-            e.get(k)
-                .map(|v| match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default()
+            e.get(k).map_or_default(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
         };
         if e.get("source").and_then(|v| v.as_str()) == Some("okf") {
             let examples = e
                 .get("examples")
                 .and_then(|x| x.as_array())
-                .map(|xs| {
+                .map_or_default(|xs| {
                     xs.iter()
                         .filter_map(|x| x.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
-                })
-                .unwrap_or_default();
+                });
             return format!("{} bundle files, e.g. {examples}", get("files"));
         }
         if e.get("source").and_then(|v| v.as_str()) == Some("documents") {
             let examples = e
                 .get("examples")
                 .and_then(|x| x.as_array())
-                .map(|xs| {
+                .map_or_default(|xs| {
                     xs.iter()
                         .filter_map(|x| {
                             x.get("mention")
@@ -65,8 +62,7 @@ impl CandidateRow {
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
-                })
-                .unwrap_or_default();
+                });
             return format!(
                 "{} mentions in {} documents{} e.g. {examples}",
                 get("occurrences"),
@@ -572,7 +568,7 @@ mod tests {
         assert!(queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()));
         let aside = queue(&db, Queue::LowSupport).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(aside.len(), 1);
-        let id = aside.first().map(|c| c.id.to_string()).unwrap_or_default();
+        let id = aside.first().map_or_default(|c| c.id.to_string());
         let stored =
             accept(&db, &[(id, Decision::Accept)], None).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(stored.class("rumor").is_some());

@@ -263,7 +263,7 @@ async fn failed_chunks_are_skipped_and_all_failures_is_an_error() {
     // Every chunk reports once, in order, with the failure count so
     // far (issue #67: the run was silent until the end).
     assert_eq!(
-        seen.lock().map(|s| s.clone()).unwrap_or_default(),
+        seen.lock().map_or_default(|s| s.clone()),
         [(1, 2, 1), (2, 2, 1)]
     );
     let all_bad = vec![SampledChunk {

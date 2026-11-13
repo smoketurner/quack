@@ -178,8 +178,7 @@ pub(crate) mod tests {
         let missing = p
             .required("b.xml", "a test package")
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(missing.contains("b.xml is missing"), "{missing}");
         assert!(
             Package::open(b"nope", "a test package", DecompressionBudget::megabytes(1)).is_err()

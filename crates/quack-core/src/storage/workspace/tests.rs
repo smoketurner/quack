@@ -40,8 +40,7 @@ fn the_sql_schema_quotes_what_needs_it_and_hides_internal_tables() {
         schema
             .tables
             .get(at)
-            .map(|t| t.columns.iter().map(|c| c.sql.as_str()).collect())
-            .unwrap_or_default()
+            .map_or_default(|t| t.columns.iter().map(|c| c.sql.as_str()).collect())
     };
     let sales = columns(1);
     assert_eq!(sales, ["region", "\"Revenue\"", "\"select\""]);
@@ -311,7 +310,7 @@ fn workspace_connection_is_confined_to_its_directory_and_locked() {
     ] {
         let err = db.execute_query(&sql).err();
         assert!(err.is_some(), "ran outside the sandbox: {sql}");
-        let text = err.map(|e| e.to_string()).unwrap_or_default();
+        let text = err.map_or_default(|e| e.to_string());
         // Replacement scans are simply gone, so `FROM 'file'` is a
         // catalog miss; everything else is a permission or lock error.
         assert!(
@@ -538,7 +537,7 @@ fn reader_clone_is_confined_like_the_writer() {
         ))
         .err();
     assert!(err.is_some(), "the reader escaped the sandbox");
-    let text = err.map(|e| e.to_string()).unwrap_or_default();
+    let text = err.map_or_default(|e| e.to_string());
     // `read_csv_auto` on a real, existing file outside the workspace
     // has only one legitimate way to fail: the confinement check.
     // Unlike the writer's confinement test, nothing here can produce a
@@ -609,8 +608,7 @@ fn in_memory_connection_reads_no_files_at_all() {
             file.display()
         ))
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(err.contains("Permission Error"), "{err}");
     assert!(db.execute_statement("SET threads = 1").is_err());
 }
@@ -3430,8 +3428,7 @@ fn opening_a_version_15_workspace_lists_each_columns_values() {
     let state = profiles
         .get("events")
         .and_then(|p| p.columns.first())
-        .map(|c| c.values.clone())
-        .unwrap_or_default();
+        .map_or_default(|c| c.values.clone());
     assert_eq!(state, ["IOWA", "TEXAS"]);
     let range = profiles
         .get("events")

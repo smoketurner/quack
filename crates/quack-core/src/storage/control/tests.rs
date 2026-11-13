@@ -239,7 +239,7 @@ async fn workspace_updates_keep_unset_fields() {
         "{taken:?}"
     );
     assert_eq!(
-        taken.err().map(|e| e.to_string()).unwrap_or_default(),
+        taken.err().map_or_default(|e| e.to_string()),
         "workspace 'w' already exists"
     );
 }

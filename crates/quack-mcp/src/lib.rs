@@ -1872,10 +1872,7 @@ impl McpServer {
                     let Some(session) = sessions::get_session(db, &id)? else {
                         return Ok(false);
                     };
-                    if !session.visible_to(&viewer) {
-                        return Ok(false);
-                    }
-                    Ok(true)
+                    Ok(session.visible_to(&viewer))
                 })
                 .await?;
             return Ok(if found {
@@ -1954,7 +1951,7 @@ impl McpServer {
             }
             WorkspaceResource::Context => {
                 let current = self.reader_db(context::current).await?;
-                current.map(|c| c.content).unwrap_or_default()
+                current.map_or_default(|c| c.content)
             }
             WorkspaceResource::Jobs => {
                 let jobs = self.inner.jobs.list_workspace(&self.inner.workspace.id);

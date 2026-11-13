@@ -545,7 +545,7 @@ impl TurnRecorder {
     /// The steps recorded so far, in order.
     #[must_use]
     pub fn steps(&self) -> Vec<ToolStep> {
-        self.steps.lock().map(|s| s.clone()).unwrap_or_default()
+        self.steps.lock().map_or_default(|s| s.clone())
     }
 }
 

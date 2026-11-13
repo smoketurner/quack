@@ -256,7 +256,7 @@ impl Proxies {
             }
         }
 
-        let no_proxy = environment.no.map(|v| v.value).unwrap_or_default();
+        let no_proxy = environment.no.map_or_default(|v| v.value);
         let mut no_proxy_entries = 0_usize;
         for entry in no_proxy.split(',').map(str::trim) {
             if entry.is_empty() {
@@ -274,12 +274,8 @@ impl Proxies {
         for problem in &problems {
             tracing::warn!("{problem}; {}", problem.fix());
         }
-        let as_value = |proxy: &Option<ProxyUrl>| {
-            proxy
-                .as_ref()
-                .map(|p| p.url.as_str().to_owned())
-                .unwrap_or_default()
-        };
+        let as_value =
+            |proxy: &Option<ProxyUrl>| proxy.as_ref().map_or_default(|p| p.url.as_str().to_owned());
         let matcher = Matcher::builder()
             .http(as_value(&http))
             .https(as_value(&https))
@@ -514,7 +510,7 @@ mod tests {
     fn a_value_without_a_scheme_is_an_http_proxy_and_the_password_is_not_shown() {
         let proxies = both("user:s3cret@proxy.corp:8080", "");
         assert!(proxies.problems().is_empty(), "{:?}", proxies.problems());
-        let shown = proxies.https().map(ToString::to_string).unwrap_or_default();
+        let shown = proxies.https().map_or_default(ToString::to_string);
         assert_eq!(shown, "proxy.corp:8080");
         assert_eq!(route(&proxies, "https://example.com/"), Route::Proxied);
     }

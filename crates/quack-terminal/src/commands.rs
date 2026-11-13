@@ -563,10 +563,7 @@ fn visible_args(command: &Command) -> impl Iterator<Item = &Arg> {
 
 /// The first line of a command's description.
 fn about(command: &Command) -> String {
-    command
-        .get_about()
-        .map(ToString::to_string)
-        .unwrap_or_default()
+    command.get_about().map_or_default(ToString::to_string)
 }
 
 /// What may follow a command's name: its positionals by value name,
@@ -716,7 +713,7 @@ impl Suggestion {
         Self {
             word: flag,
             label,
-            about: arg.get_help().map(ToString::to_string).unwrap_or_default(),
+            about: arg.get_help().map_or_default(ToString::to_string),
             follows: Follows::Arguments,
         }
     }
@@ -806,10 +803,7 @@ impl Completion {
                     items.push(Suggestion {
                         word: value.get_name().to_owned(),
                         label: value.get_name().to_owned(),
-                        about: value
-                            .get_help()
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
+                        about: value.get_help().map_or_default(ToString::to_string),
                         follows: Follows::Nothing,
                     });
                 }

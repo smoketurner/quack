@@ -170,9 +170,9 @@ impl Picker {
         };
         // How it ended, or how far it has got.
         let detail = if job.state.is_finished() {
-            job.outcome.as_deref().map(one_line).unwrap_or_default()
+            job.outcome.as_deref().map_or_default(one_line)
         } else {
-            let mut detail = job.progress.map(|p| p.to_string()).unwrap_or_default();
+            let mut detail = job.progress.map_or_default(|p| p.to_string());
             for note in [
                 job.status.as_deref(),
                 job.cancel_requested.then_some("cancelling"),

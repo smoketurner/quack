@@ -282,7 +282,7 @@ async fn a_one_shot_answer_cut_at_the_output_limit_is_refused() {
             .unwrap_or_else(|e| fail(&e.to_string()))
             .answer("hello")
             .await;
-        let message = answer.err().map(|e| e.to_string()).unwrap_or_default();
+        let message = answer.err().map_or_default(|e| e.to_string());
         assert!(
             message.contains(
                 "the graph extraction answer was cut off at the model's output limit"

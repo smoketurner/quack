@@ -156,12 +156,7 @@ async fn hosted_providers_are_found_by_their_credentials_alone() {
         ..Environment::default()
     };
     let discovery = Discovery::run(&env).await;
-    let line = |kind| {
-        discovery
-            .get(kind)
-            .map(ToString::to_string)
-            .unwrap_or_default()
-    };
+    let line = |kind| discovery.get(kind).map_or_default(ToString::to_string);
     assert_eq!(
         line(ProviderKind::Anthropic),
         "✓ Anthropic: ANTHROPIC_API_KEY is set"
@@ -408,8 +403,7 @@ fn a_section_of_the_same_name_for_another_provider_is_refused() {
     let error = plan
         .apply(Some(existing))
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         error.contains("[providers.anthropic] is already a different provider"),
         "{error}"

@@ -81,8 +81,7 @@ async fn an_extract_reset_asks_before_it_clears_the_graph() {
         )
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(
         refused.contains("Clear all 2 nodes and 0 edges, including what people asserted?")
             && refused.contains("nothing was dropped"),
@@ -117,8 +116,7 @@ async fn revalidate_says_what_it_drops_and_needs_yes_to_drop_it() {
     let refused = revalidate(&db, false)
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     for part in [
         "Revalidating against ontology version 2 drops 1 nodes and 0 edges:",
         "class place, which the ontology no longer defines: 1 nodes",
@@ -227,8 +225,7 @@ mod edit_tests {
         let refused = graph(&db, node("Babbage", "robot", &[], None))
             .await
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(refused.contains("no class 'robot'"), "{refused}");
         graph(&db, node("London", "place", &[], None))
             .await
@@ -251,8 +248,7 @@ mod edit_tests {
         );
         let bad_pair = Properties::parse_pairs(["novalue"])
             .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .map_or_default(|e| e.to_string());
         assert!(bad_pair.contains("is not KEY=VALUE"), "{bad_pair}");
     }
 
@@ -322,8 +318,7 @@ mod edit_tests {
         )
         .await
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
         assert!(nothing.contains("nothing to change"), "{nothing}");
         let deleted = graph(
             &db,

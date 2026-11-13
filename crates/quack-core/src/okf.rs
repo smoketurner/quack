@@ -541,7 +541,7 @@ pub fn export(
     sink: &mut impl BundleSink,
 ) -> Result<ExportSummary> {
     let ontology = ontology_store::current(db)?;
-    let context_text = context::current(db)?.map(|c| c.content).unwrap_or_default();
+    let context_text = context::current(db)?.map_or_default(|c| c.content);
     let mut index = FrontMatter::of_type(ConceptType::Index)
         .field("title", workspace_name)
         .to_string();

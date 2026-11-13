@@ -448,7 +448,7 @@ impl TermFrequencies {
         for term in analyzer
             .terms(content)
             .into_iter()
-            .chain(heading.map(|h| analyzer.terms(h)).unwrap_or_default())
+            .chain(heading.map_or_default(|h| analyzer.terms(h)))
         {
             let entry = counts.entry(term).or_insert(0);
             *entry = entry.saturating_add(1);

@@ -86,8 +86,7 @@ impl SessionTitler {
             first
                 .iter()
                 .find(|m| m.role == role)
-                .map(|m| m.content.chars().take(EXCERPT_CHARS).collect::<String>())
-                .unwrap_or_default()
+                .map_or_default(|m| m.content.chars().take(EXCERPT_CHARS).collect::<String>())
         };
         let (question, answer) = (text(MessageRole::User), text(MessageRole::Assistant));
         if question.trim().is_empty() {

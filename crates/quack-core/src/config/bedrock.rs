@@ -299,7 +299,7 @@ mod tests {
     }
 
     fn err_of(result: Result<BedrockConfig>) -> String {
-        result.err().map(|e| e.to_string()).unwrap_or_default()
+        result.err().map_or_default(|e| e.to_string())
     }
 
     #[test]

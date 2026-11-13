@@ -244,7 +244,7 @@ pub(crate) async fn extract(
     body: Option<Json<ExtractRequest>>,
 ) -> ApiResult<(StatusCode, Json<ExtractionStarted>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let request = body.map(|b| b.0).unwrap_or_default();
+    let request = body.map_or_default(|b| b.0);
     let started = access
         .start_extraction(
             &app,
@@ -565,7 +565,7 @@ pub(crate) async fn revalidate(
     approval: Option<Json<DropApproval>>,
 ) -> ApiResult<Json<Revalidation>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let approval = approval.map(|Json(approval)| approval).unwrap_or_default();
+    let approval = approval.map_or_default(|Json(approval)| approval);
     Ok(Json(access.revalidate_graph(&app, approval).await?))
 }
 
