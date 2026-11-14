@@ -88,7 +88,7 @@ jobs:
         shell: bash
         run: rm -rf target/duckdb-sources target/*/duckdb-sources
       - name: Install and start Ollama
-        uses: ai-action/setup-ollama@85cd2094215be6b76d0ad90e93393647dc7a55ba # v2.1.16
+        uses: ai-action/setup-ollama@798483f55e7466b967eee0627554aa3d0e0f3279 # v2.1.18
         env:
           # The server the action starts inherits this: the agent's prompt
           # (tables, documents, and tool guidance) runs past Ollama's default
