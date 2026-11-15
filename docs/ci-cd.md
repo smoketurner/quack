@@ -9,10 +9,17 @@
   `RUSTDOCFLAGS=-D warnings`, the same as `make doc`; `[workspace.lints.rustdoc]` denies
   broken and private intra-doc links), `dependency-review` (PRs), and `license-check`
   (`cargo-deny check`). The toolchain comes from `rust-toolchain.toml` via `rustup show`;
-  `Swatinem/rust-cache` caches builds (see [Build caching](#build-caching)). Actions are
-  SHA-pinned. `permissions: {}` is set at the top, with `contents: read` per job.
-- **`.github/workflows/secure_workflows.yml`**: fails CI if a third-party action lacks a
-  full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
+  `Swatinem/rust-cache` caches builds (see [Build caching](#build-caching)).
+  `permissions: {}` is set at the top, with `contents: read` per job.
+- **`.github/workflows/actions.lock`**: the workflow lockfile. Every `uses:` names a
+  release tag (`actions/checkout@v7.0.1`), and the lockfile records the commit that tag
+  stood for when it was locked, for each action and the actions it calls; the runner
+  refuses a tag that has moved. `gh actions-lock` writes it
+  (`gh extension install github/gh-actions-lock`); run it after adding a workflow or
+  changing a `uses:`, and commit the workflow and the lockfile together. Dependabot's
+  `github-actions` updates change both.
+- **`.github/workflows/verify-lockfile.yml`**: fails CI when the lockfile does not cover
+  every `uses:` or a locked commit no longer verifies upstream (`gh actions-lock --verify`).
 - **`.github/dependabot.yml`**: `cargo`, `github-actions`, and `docker` (the base-image
   tags), weekly, grouped, 7-day cooldown.
 - **`.github/workflows/advisories.yml`**: `cargo deny check` every Monday (and on
@@ -37,7 +44,7 @@ spend no release minutes.
 Every workflow declares a `concurrency` group. It cancels or queues depending on what a
 cancelled run would leave behind.
 
-- **`ci.yml` and `secure_workflows.yml` cancel.** A new commit supersedes the previous run,
+- **`ci.yml` and `verify-lockfile.yml` cancel.** A new commit supersedes the previous run,
   so the group is `<workflow>-<ref>` with `cancel-in-progress`. `ci.yml` has two
   exceptions:
   - It does not cancel on `refs/heads/main`. Cancelling a job skips its
@@ -57,7 +64,7 @@ cancelled run would leave behind.
     `reusable-build.yml`'s `image-index` (`release-image-index`) queue on constant groups,
     so two tags never race on the git pushes or on `imagetools create --tag latest`.
 
-`ci.yml` and `secure_workflows.yml` scope `push:` to `main`, so a branch with an open pull
+`ci.yml` and `verify-lockfile.yml` scope `push:` to `main`, so a branch with an open pull
 request runs each once, on `pull_request`.
 
 ### Merge queue
@@ -83,10 +90,10 @@ the full `check_response_timeout_minutes`.
 - **`Dependency Review`** is `if: github.event_name == 'pull_request'`, and
   `dependency-review-action` works only in a pull request context, so it skips on a merge
   group.
-- **`Harden Security`** (`secure_workflows.yml`) filters on `paths: .github/workflows/**`,
+- **`Verify lockfile`** (`verify-lockfile.yml`) filters on `paths: .github/workflows/**`,
   so it never starts for a merge group that touches no workflow file, and it has no
   `merge_group` trigger. Nothing is lost: combining pull requests cannot introduce an
-  unpinned action the per-pull-request run missed.
+  unlocked action the per-pull-request run missed.
 
 Order matters when rebuilding this setup: adding the required checks before `ci.yml`'s
 `merge_group` trigger is on `main` deadlocks the queue.
@@ -256,7 +263,7 @@ gh attestation verify oci://ghcr.io/smoketurner/quack:<version> --owner smoketur
   --signer-workflow smoketurner/quack/.github/workflows/reusable-build.yml
 ```
 
-Every action is SHA-pinned. A release never writes a cache a later run could be poisoned
+Every action is locked to a commit by `actions.lock`. A release never writes a cache a later run could be poisoned
 by: `reusable-build.yml` uses no Actions cache, and `release.yml`'s gates job runs
 `rust-cache` restore-only (`save-if: false`).
 
@@ -305,8 +312,8 @@ and `docker compose up -d`.
 - CI tests on Linux, macOS, and Windows (Windows runs on pull requests and `main`, not in
   the merge queue, so a pull request should show it green before it merges), but only a `workflow_dispatch` release run exercises the release builds
   themselves. Run one before tagging after any build change.
-- Pin every new action to a SHA (`secure_workflows.yml` enforces it). Resolve current SHAs
-  with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
+- Name every new action by its release tag and run `gh actions-lock`
+  (`verify-lockfile.yml` enforces it).
 
 ## Fuzzing
 
