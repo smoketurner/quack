@@ -54,7 +54,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Setup Rust toolchain
@@ -77,7 +77,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -96,7 +96,7 @@ jobs:
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         id: cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "clippy-${{ runner.os }}"
@@ -142,7 +142,7 @@ jobs:
             runner: macos-latest
             install-deps: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -162,7 +162,7 @@ jobs:
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         id: cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
@@ -200,7 +200,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Setup Rust toolchain
@@ -217,7 +217,7 @@ jobs:
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         id: cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
@@ -272,10 +272,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - uses: actions/dependency-review-action@v5.0.0
         with:
           vulnerability-check: true
           license-check: true
@@ -286,11 +286,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       # `check` runs advisories + bans + licenses + sources, so the
       # OpenSSL/ring bans in deny.toml are enforced too (see docs/crypto.md).
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check

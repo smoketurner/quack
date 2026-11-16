@@ -6,8 +6,8 @@ default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit]
 
 repos:
-  # Generic file hygiene + private-key detection (external, SHA-pinned to match the
-  # repo's GitHub Actions convention). Some hooks auto-fix files.
+  # Generic file hygiene + private-key detection (external, SHA-pinned).
+  # Some hooks auto-fix files.
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
     hooks:

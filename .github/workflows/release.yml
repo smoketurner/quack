@@ -59,7 +59,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -79,7 +79,7 @@ jobs:
       # the tests) on every release. `save-if: false` is the restore-only knob.
       - name: Setup Rust cache
         id: cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.2 # zizmor: ignore[cache-poisoning]
+        uses: Swatinem/rust-cache@v2.9.3 # zizmor: ignore[cache-poisoning]
         with:
           prefix-key: "v1"
           # Matches ci.yml's `test` job, so this restores what CI already built —
@@ -112,7 +112,7 @@ jobs:
         # which needs a cargo-deny install this runner does not have. The
         # pinned cargo-deny action below is how this workflow checks deny.
         run: make crypto-gates
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check
       # The release notes: the commits since the previous tag grouped by type
@@ -120,7 +120,7 @@ jobs:
       # `publish` only downloads.
       - name: Render the commits since the previous tag
         if: github.ref_type == 'tag'
-        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        uses: orhun/git-cliff-action@v4.9.1
         with:
           config: cliff.toml
           args: --latest --strip header
@@ -128,7 +128,7 @@ jobs:
           OUTPUT: notes.md
       - name: Upload the release notes
         if: github.ref_type == 'tag'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-notes
           path: notes.md
@@ -199,22 +199,22 @@ jobs:
       contents: write
     steps:
       # No checkout: this job only moves artifacts the build workflow produced.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: binaries-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: images-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: packages-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: release-notes
           path: notes
@@ -252,13 +252,13 @@ jobs:
       cancel-in-progress: false
     permissions: {}
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: packages-*
           path: packages
           merge-multiple: true
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with: # zizmor: ignore[artipacked] — the credentials push the commit below
           repository: smoketurner/packages
           token: ${{ secrets.PACKAGES_REPO_TOKEN }}
@@ -362,7 +362,7 @@ jobs:
           fi
           echo "macos_arm64=${sha}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with: # zizmor: ignore[artipacked] — the credentials push the commit below
           repository: smoketurner/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
