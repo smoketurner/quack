@@ -14,7 +14,7 @@ workflows:
     '.github/workflows/eval.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/upload-artifact@v7.0.2'
-        - 'ai-action/setup-ollama@v2.1.16'
+        - 'ai-action/setup-ollama@v2.1.18'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/fuzz.yml':
         - 'actions/checkout@v7.0.1'
@@ -35,7 +35,7 @@ workflows:
         - 'actions/upload-artifact@v7.0.2'
         - 'docker/bake-action@v7.5.0'
         - 'docker/build-push-action@v7.4.0'
-        - 'docker/login-action@v4.7.0'
+        - 'docker/login-action@v4.8.0'
         - 'docker/setup-buildx-action@v4.4.1'
         - 'skeeto/aas-sign@v1.1.1'
     '.github/workflows/verify-lockfile.yml':
@@ -66,9 +66,9 @@ dependencies:
         commit: 'sha1-cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         owner_id: 44036562
         repo_id: 192625955
-    'ai-action/setup-ollama@v2.1.16':
-        ref: 'v2.1.16'
-        commit: 'sha1-85cd2094215be6b76d0ad90e93393647dc7a55ba'
+    'ai-action/setup-ollama@v2.1.18':
+        ref: 'v2.1.18'
+        commit: 'sha1-798483f55e7466b967eee0627554aa3d0e0f3279'
         owner_id: 199858026
         repo_id: 935740819
     'docker/bake-action@v7.5.0':
@@ -81,9 +81,9 @@ dependencies:
         commit: 'sha1-c3c9e263c25d99ce0380d002d59b67737d91b0dc'
         owner_id: 5429470
         repo_id: 241092383
-    'docker/login-action@v4.7.0':
-        ref: 'v4.7.0'
-        commit: 'sha1-81c6f93d4bc991e510b342a00b419b3bb4efc5c6'
+    'docker/login-action@v4.8.0':
+        ref: 'v4.8.0'
+        commit: 'sha1-8aa5831fb8d48d8f76594c7ddde61ae58019f550'
         owner_id: 5429470
         repo_id: 287743349
     'docker/setup-buildx-action@v4.4.1':
