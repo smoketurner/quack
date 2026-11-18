@@ -1,0 +1,4 @@
+# cc instruments C code for AddressSanitizer when rustc does, and the FIPS
+# module's delocate step refuses the data sections that adds.
+[env]
+AWS_LC_FIPS_SYS_CFLAGS = "-fno-sanitize=address"

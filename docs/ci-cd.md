@@ -328,6 +328,10 @@ cargo install cargo-fuzz --locked
 cd fuzz && cargo +nightly fuzz run docx -- -max_total_time=120
 ```
 
+`fuzz/.cargo/config.toml` builds the FIPS AWS-LC module without AddressSanitizer: `cc`
+instruments C code whenever rustc does, and the module's delocate step refuses the data
+sections that adds. Every other crate, C code included, keeps the sanitizer.
+
 `fuzz/corpus/`, `fuzz/artifacts/`, and `fuzz/target/` are gitignored. A crash leaves its
 input under `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <that file>`
 replays it.
