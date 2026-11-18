@@ -174,8 +174,8 @@ attestation names `reusable-build.yml`, so a consumer can require that identity.
    `GH_REPO`: with no checkout, `gh` has no git remote and fails with "not a git
    repository".
 5. **publish-packages** (tag only, after publish, no `GITHUB_TOKEN` permissions):
-   - Checks out `smoketurner/packages` with `PACKAGES_REPO_TOKEN` (a fine-grained token with
-     contents: write on that repository alone).
+   - Checks out `smoketurner/packages` with `PACKAGES_DEPLOY_KEY` (a deploy key with write
+     access to that repository alone).
    - Copies the `.deb` files into `apt/pool/main/` and each `.rpm` into `rpm/x86_64/` or
      `rpm/aarch64/`.
    - Regenerates the APT indices (`dpkg-scanpackages`, `apt-ftparchive release`) and the

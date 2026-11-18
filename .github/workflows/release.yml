@@ -238,8 +238,8 @@ jobs:
 
   # Adds the packages the build signed to the APT and YUM repositories in
   # smoketurner/packages, re-signs their metadata, and pushes. The push uses
-  # PACKAGES_REPO_TOKEN, a fine-grained token with contents: write on that one
-  # repository; a GITHUB_TOKEN push could not reach it, and a PAT push is what
+  # PACKAGES_DEPLOY_KEY, a deploy key with write access to that one repository;
+  # a GITHUB_TOKEN push could not reach it, and a deploy-key push is what
   # triggers its publish-to-s3.yml. Runs after publish so a failed GitHub
   # release never leaves packages in the repository without a release.
   publish-packages:
@@ -261,7 +261,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with: # zizmor: ignore[artipacked] — the credentials push the commit below
           repository: smoketurner/packages
-          token: ${{ secrets.PACKAGES_REPO_TOKEN }}
+          ssh-key: ${{ secrets.PACKAGES_DEPLOY_KEY }}
           path: packages-repo
 
       - name: Install repository tools
@@ -332,9 +332,9 @@ jobs:
           git push
 
   # Rewrites Formula/quack.rb in smoketurner/homebrew-tap to point at this
-  # release's macOS arm64 archive. The push uses HOMEBREW_TAP_TOKEN, a
-  # fine-grained token with contents: write on that one repository. Runs after
-  # publish so the formula never names an archive that is not downloadable yet.
+  # release's macOS arm64 archive. The push uses HOMEBREW_TAP_DEPLOY_KEY, a
+  # deploy key with write access to that one repository. Runs after publish so
+  # the formula never names an archive that is not downloadable yet.
   homebrew:
     name: Update the Homebrew tap
     if: github.ref_type == 'tag'
@@ -365,7 +365,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with: # zizmor: ignore[artipacked] — the credentials push the commit below
           repository: smoketurner/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: homebrew-tap
 
       - name: Write the formula
