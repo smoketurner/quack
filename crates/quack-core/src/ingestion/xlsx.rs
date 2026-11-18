@@ -570,7 +570,10 @@ fn days_since_epoch(date: jiff::civil::Date) -> Option<i32> {
 }
 
 fn micros_since_epoch(datetime: jiff::civil::DateTime) -> Option<i64> {
-    let ts = datetime.to_zoned(jiff::tz::TimeZone::UTC).ok()?.timestamp();
+    let ts = datetime
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+        .ok()?
+        .timestamp();
     Some(ts.as_microsecond())
 }
 

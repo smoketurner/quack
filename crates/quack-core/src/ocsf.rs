@@ -138,7 +138,7 @@ impl AuditRow {
             Outcome::Denied | Outcome::Error => (2, "Failure"),
         };
         let time = DateTime::strptime("%Y-%m-%d %H:%M:%S", &self.timestamp)
-            .and_then(|dt| dt.to_zoned(TimeZone::UTC))
+            .and_then(|dt| dt.to_zoned_datetime(TimeZone::UTC))
             .map_err(|e| Error::Config(format!("audit timestamp {:?}: {e}", self.timestamp)))?
             .timestamp();
         let user = entry.user_id.as_ref().map(|id| json!({ "uid": id }));

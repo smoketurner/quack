@@ -41,7 +41,7 @@ pub const INTERRUPTED: &str = "the process running it ended before it finished";
 
 /// `DuckDB`'s naive timestamp text for `ts`, in UTC.
 fn timestamp_param(ts: Timestamp) -> String {
-    ts.to_zoned(TimeZone::UTC)
+    ts.to_zoned_datetime(TimeZone::UTC)
         .datetime()
         .strftime("%Y-%m-%d %H:%M:%S%.6f")
         .to_string()
@@ -53,7 +53,7 @@ fn timestamp_of(text: &str) -> Result<Timestamp> {
         .parse()
         .map_err(|e: jiff::Error| Error::Analysis(format!("malformed job time {text:?}: {e}")))?;
     civil
-        .to_zoned(TimeZone::UTC)
+        .to_zoned_datetime(TimeZone::UTC)
         .map(|zoned| zoned.timestamp())
         .map_err(|e| Error::Analysis(format!("malformed job time {text:?}: {e}")))
 }

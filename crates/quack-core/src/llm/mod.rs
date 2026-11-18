@@ -15,7 +15,7 @@ mod slot;
 pub mod titles;
 pub mod vision;
 
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 use rig::agent::OutputMode;
 use rig::embeddings::Embedding;
 use rig::providers::{anthropic, ollama, openai};
@@ -1524,7 +1524,7 @@ async fn start_turn<'c>(
             let prompt = PromptOptions {
                 scope: DocumentScope::resolve(guard, &documents)?,
                 mode: session.mode,
-                today: Zoned::now().date(),
+                today: ZonedDateTime::now().date(),
                 write_policy: policy,
                 pinned_token_budget,
                 context: context::combined(guard)?,

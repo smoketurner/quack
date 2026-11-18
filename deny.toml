@@ -30,6 +30,11 @@ ignore = [
     # still reads its -wal), so a crafted pair could put stale process memory
     # into the imported table. Remove this once sqlx moves to 0.39.
     "RUSTSEC-2026-0459",
+    # chrono is unmaintained, with no fixed release and no vulnerability named.
+    # quack uses jiff; chrono arrives only through arrow (duckdb), oauth2,
+    # pdf_oxide, rmcp, and schemars, none of which has a release without it.
+    # Remove this once those crates move off chrono.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
