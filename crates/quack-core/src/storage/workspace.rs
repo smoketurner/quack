@@ -6711,7 +6711,7 @@ fn timestamp_text(unit: duckdb::types::TimeUnit, n: i64) -> String {
     let Ok(ts) = jiff::Timestamp::from_nanosecond(nanos) else {
         return n.to_string();
     };
-    let civil = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+    let civil = ts.to_zoned_datetime(jiff::tz::TimeZone::UTC).datetime();
     if civil.subsec_nanosecond() == 0 {
         civil.strftime("%Y-%m-%d %H:%M:%S").to_string()
     } else {

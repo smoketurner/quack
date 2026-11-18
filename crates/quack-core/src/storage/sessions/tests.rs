@@ -277,7 +277,7 @@ fn a_turn_keeps_when_it_was_asked_and_how_long_it_took() {
     let utc = |text: &str| {
         text.parse::<jiff::civil::DateTime>()
             .unwrap()
-            .to_zoned(jiff::tz::TimeZone::UTC)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
             .unwrap()
             .timestamp()
     };

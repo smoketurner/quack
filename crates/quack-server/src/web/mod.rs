@@ -319,7 +319,7 @@ impl Moment {
         }
         let civil: DateTime = text.parse().ok()?;
         civil
-            .to_zoned(TimeZone::UTC)
+            .to_zoned_datetime(TimeZone::UTC)
             .ok()
             .map(|z| Self(z.timestamp()))
     }

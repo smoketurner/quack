@@ -592,7 +592,9 @@ impl FromStr for Expiry {
 
     fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
         let at = jiff::fmt::strtime::parse(SQLITE_TIME, text)?.to_datetime()?;
-        Ok(Self(at.to_zoned(jiff::tz::TimeZone::UTC)?.timestamp()))
+        Ok(Self(
+            at.to_zoned_datetime(jiff::tz::TimeZone::UTC)?.timestamp(),
+        ))
     }
 }
 
