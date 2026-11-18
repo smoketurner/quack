@@ -4401,7 +4401,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quack"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "quack-cli"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4445,7 +4445,7 @@ dependencies = [
 
 [[package]]
 name = "quack-core"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "apple-native-keyring-store",
  "argon2",
@@ -4523,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "quack-eval"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4534,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "quack-mcp"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "anyhow",
  "http",
@@ -4552,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "quack-server"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "anyhow",
  "askama",
@@ -4589,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "quack-terminal"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4616,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "quack-testkit"
-version = "2026.11.2"
+version = "2026.11.3"
 dependencies = [
  "axum",
  "quack-core",
