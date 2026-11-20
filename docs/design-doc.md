@@ -2257,8 +2257,8 @@ message.
 - History sent to the model is trimmed to `history_token_budget` (32,000), oldest first. Tool
   messages are never replayed; only user and assistant text goes back. It loads through
   `llm::memory::History`: `storage::sessions::session_turns` reads the session's turns, and
-  `TranscriptWindow` is rig-memory's `recent::TokenBudget` at four characters per token that
-  also drops an answer whose question fell outside. The turns it leaves out are not replayed and
+  `TranscriptWindow` is a rig-memory `recent::Recent` at four characters per token, walked
+  through `recent::view` so no result loses its call, that also drops an answer whose question fell outside. The turns it leaves out are not replayed and
   nothing summarizes them; a turn's load calls no model. A file from a quack that kept
   summaries has its `_quack_session_summaries` dropped on open.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and

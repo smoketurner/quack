@@ -559,7 +559,7 @@ impl Signer {
         &self,
         mut request: http::Request<Bytes>,
     ) -> std::result::Result<http::Request<Bytes>, rig::http_client::Error> {
-        let failed = |e: String| rig::http_client::Error::Instance(e.into());
+        let failed = |e: String| rig::http_client::Error::permanent(e);
         request.headers_mut().remove(http::header::AUTHORIZATION);
         let headers = request
             .headers()

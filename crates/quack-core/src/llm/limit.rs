@@ -248,7 +248,7 @@ impl Attempts {
         {
             return self.wait_for_status(attempt, *status, headers);
         }
-        if attempt >= self.policy.max_retries || !rig::error::transient_transport(error) {
+        if attempt >= self.policy.max_retries || !error.is_transient() {
             return None;
         }
         Some(self.policy.next_wait(attempt.saturating_add(1)))
@@ -465,11 +465,8 @@ impl LimitedHttp {
 }
 
 /// Hold `permit` until the lazily read body has been read (or dropped).
-fn body_holding<U: Send + 'static>(
-    response: Response<LazyBody<U>>,
-    permit: Option<GatePermit>,
-) -> Response<LazyBody<U>> {
-    response.map(|body| -> LazyBody<U> {
+fn body_holding(response: Response<LazyBody>, permit: Option<GatePermit>) -> Response<LazyBody> {
+    response.map(|body| -> LazyBody {
         Box::pin(async move {
             let read = body.await;
             drop(permit);
@@ -524,19 +521,13 @@ impl Blueprint {
 }
 
 impl HttpClientExt for LimitedHttp {
-    fn send<T, U>(
+    fn send(
         &self,
-        req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
-    where
-        T: Into<Bytes> + Send,
-        U: From<Bytes> + Send + 'static,
-    {
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
         let inner = self.inner.clone();
-        // Read the body now: `T` need not outlive this call, and the gate
-        // is chosen by the model it names.
+        // The gate is chosen by the model the body names.
         let (parts, body) = req.into_parts();
-        let body: Bytes = body.into();
         let model = GateKey::model_of(&body);
         let permit = self.gates.permit(model.clone());
         let gates = self.gates.clone();
@@ -544,9 +535,11 @@ impl HttpClientExt for LimitedHttp {
         let headers = self.headers.clone();
         let attempts = self.attempts.clone();
         let provider = self.provider_name();
-        async move {
+        // Boxed: the attempt loop holds the inner transport's send, whose
+        // future is large enough to bloat every caller's.
+        Box::pin(async move {
             let waited = Instant::now();
-            let mut permit = permit.await.map_err(http_client::Error::instance)?;
+            let mut permit = permit.await.map_err(http_client::Error::permanent)?;
             telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
             let blueprint = Blueprint { parts, body };
             let mut attempt = 0_u32;
@@ -579,7 +572,7 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                     Err(error) => {
                         telemetry::provider_request(
@@ -604,21 +597,18 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                 }
                 attempt = attempt.saturating_add(1);
             }
-        }
+        })
     }
 
-    fn send_multipart<U>(
+    fn send_multipart(
         &self,
         mut req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
-    where
-        U: From<Bytes> + Send + 'static,
-    {
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
         let inner = self.inner.clone();
         let permit = self.gates.permit(None);
         let authorize = self.authorize.clone();
@@ -627,8 +617,8 @@ impl HttpClientExt for LimitedHttp {
             match authorize {
                 // SigV4 signs the body, and a multipart body is not built yet.
                 Some(Authorize::Sign(_)) => {
-                    return Err(http_client::Error::Instance(
-                        "multipart requests cannot be SigV4-signed".into(),
+                    return Err(http_client::Error::permanent(
+                        "multipart requests cannot be SigV4-signed",
                     ));
                 }
                 Some(Authorize::Bearer(value)) => {
@@ -636,7 +626,7 @@ impl HttpClientExt for LimitedHttp {
                 }
                 None => {}
             }
-            let permit = permit.await.map_err(http_client::Error::instance)?;
+            let permit = permit.await.map_err(http_client::Error::permanent)?;
             let response = inner.send_multipart(req).await?;
             Ok(body_holding(response, permit))
         }
@@ -645,16 +635,12 @@ impl HttpClientExt for LimitedHttp {
     /// A streamed request is tried again only until its head arrives:
     /// once the response status is good, the stream is the model's answer
     /// and a break in it ends the turn rather than restarting it.
-    fn send_streaming<T>(
+    fn send_streaming(
         &self,
-        req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
-    where
-        T: Into<Bytes> + Send,
-    {
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
-        let body: Bytes = body.into();
         let model = GateKey::model_of(&body);
         let permit = self.gates.permit(model.clone());
         let gates = self.gates.clone();
@@ -662,9 +648,11 @@ impl HttpClientExt for LimitedHttp {
         let headers = self.headers.clone();
         let attempts = self.attempts.clone();
         let provider = self.provider_name();
-        async move {
+        // Boxed: the attempt loop holds the inner transport's send, whose
+        // future is large enough to bloat every caller's.
+        Box::pin(async move {
             let waited = Instant::now();
-            let mut permit = permit.await.map_err(http_client::Error::instance)?;
+            let mut permit = permit.await.map_err(http_client::Error::permanent)?;
             telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
             let blueprint = Blueprint { parts, body };
             let mut attempt = 0_u32;
@@ -702,7 +690,7 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                     Err(error) => {
                         telemetry::provider_request(
@@ -727,12 +715,12 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                 }
                 attempt = attempt.saturating_add(1);
             }
-        }
+        })
     }
 }
 

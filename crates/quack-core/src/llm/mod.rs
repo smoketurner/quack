@@ -15,6 +15,7 @@ mod slot;
 pub mod titles;
 pub mod vision;
 
+use bytes::Bytes;
 use jiff::{Timestamp, ZonedDateTime};
 use rig::agent::OutputMode;
 use rig::embeddings::Embedding;
@@ -257,10 +258,10 @@ impl EmbeddingModel for OllamaEmbedder {
         let request = self
             .endpoint
             .request(http::Method::POST, "api/embed")
-            .body(body)?;
+            .body(Bytes::from(body))?;
         // A non-success status is the transport's error, body and all.
-        let response = self.endpoint.http.send::<_, Vec<u8>>(request).await?;
-        let bytes: Vec<u8> = response.into_body().await?;
+        let response = self.endpoint.http.send(request).await?;
+        let bytes: Bytes = response.into_body().await?;
         let parsed: OllamaEmbedResponse = serde_json::from_slice(&bytes)?;
         if parsed.embeddings.len() != texts.len() {
             return Err(ProviderError::Response(format!(
@@ -1012,9 +1013,9 @@ impl OllamaEndpoint {
     ) -> std::result::Result<T, OllamaCallError> {
         use rig::http_client::HttpClientExt;
 
-        let request = self.request(method, path).body(body)?;
-        let response = self.http.send::<_, Vec<u8>>(request).await?;
-        let bytes: Vec<u8> = response.into_body().await?;
+        let request = self.request(method, path).body(Bytes::from(body))?;
+        let response = self.http.send(request).await?;
+        let bytes: Bytes = response.into_body().await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 

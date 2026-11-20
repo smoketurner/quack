@@ -22,7 +22,7 @@ use crate::graph::GraphResult;
 use crate::ids::{MessageId, SessionId, UserId};
 use crate::storage::control::ResourceKind;
 use crate::text::Tokens;
-use rig::memory::recent::{self, TokenBudget};
+use rig::memory::recent::{self, Recent};
 use rig::message::{AssistantContent, Message, UserContent};
 
 use super::workspace::{QueryResults, WorkspaceDb};
@@ -890,30 +890,29 @@ impl SpokenText for Message {
     }
 }
 
-/// The history window: rig's [`TokenBudget`] over
+/// The history window: the newest messages within
 /// `[analysis].history_token_budget`, counting four characters per token
-/// ([`Tokens::estimate`]) so budgets read as before, then the window's
-/// leading answer dropped when its question fell outside: a replayed thread
-/// opens on a question.
-pub struct TranscriptWindow(TokenBudget<fn(&Message) -> usize>);
+/// ([`Tokens::estimate`]) so budgets read as before, through rig's
+/// [`recent::view`] (which keeps every result with its call), then the
+/// window's leading answer dropped when its question fell outside: a
+/// replayed thread opens on a question.
+pub struct TranscriptWindow {
+    max_tokens: usize,
+}
 
 impl TranscriptWindow {
     #[must_use]
     pub fn new(budget: Tokens) -> Self {
-        Self(TokenBudget {
+        Self {
             max_tokens: usize::try_from(budget.get()).unwrap_or(usize::MAX),
-            counter: |message: &Message| {
-                usize::try_from(Tokens::estimate(&message.spoken_text()).get())
-                    .unwrap_or(usize::MAX)
-            },
-        })
+        }
     }
 
     /// The newest `messages` within the budget, oldest first.
     #[must_use]
     pub fn apply(&self, messages: Vec<Message>) -> Vec<Message> {
         let messages: Vec<Arc<Message>> = messages.into_iter().map(Arc::new).collect();
-        let kept = recent::view(&messages, &self.0);
+        let kept = recent::view(&messages, self);
         let answers = kept
             .iter()
             .take_while(|m| matches!(***m, Message::Assistant { .. }))
@@ -922,6 +921,25 @@ impl TranscriptWindow {
             .skip(answers)
             .map(|m| m.as_ref().clone())
             .collect()
+    }
+}
+
+/// Walking back from the newest message, stop before the first that does
+/// not fit, as rig's own `TokenBudget` does with its byte heuristic.
+impl Recent for TranscriptWindow {
+    fn start(&self, messages: &[Arc<Message>]) -> usize {
+        let mut budget = self.max_tokens;
+        let mut start = messages.len();
+        for (index, message) in messages.iter().enumerate().rev() {
+            let cost = usize::try_from(Tokens::estimate(&message.spoken_text()).get())
+                .unwrap_or(usize::MAX);
+            let Some(left) = budget.checked_sub(cost) else {
+                break;
+            };
+            budget = left;
+            start = index;
+        }
+        start
     }
 }
 

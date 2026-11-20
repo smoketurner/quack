@@ -66,7 +66,7 @@ async fn call(client: LimitedHttp, url: String, body: &'static str) -> Bytes {
         .body(Bytes::from_static(body.as_bytes()))
         .unwrap_or_else(|e| fail(&e.to_string()));
     // The gates read the scope when `send` is called, so call it inside.
-    let sent = async { client.send::<_, Bytes>(request).await };
+    let sent = async { client.send(request).await };
     let response = Egress::scope(Some(Egress::NoWorkspace), sent)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -138,7 +138,7 @@ async fn a_request_the_scope_refuses_is_never_sent() {
             .body(Bytes::from_static(body.as_bytes()))
             .unwrap_or_else(|e| fail(&e.to_string()));
         async move {
-            let sent = async { client.send::<_, Bytes>(request).await };
+            let sent = async { client.send(request).await };
             match Egress::scope(egress, sent).await {
                 Ok(_) => String::from("sent"),
                 Err(e) => e.to_string(),
@@ -340,7 +340,7 @@ async fn status_of(client: LimitedHttp, url: String) -> Result<u16, String> {
     let request = Request::post(url)
         .body(Bytes::from_static(br#"{"model":"m"}"#))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let sent = async { client.send::<_, Bytes>(request).await };
+    let sent = async { client.send(request).await };
     Egress::scope(Some(Egress::NoWorkspace), sent)
         .await
         .map(|r| r.status().as_u16())
