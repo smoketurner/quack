@@ -14,7 +14,7 @@ workflows:
     '.github/workflows/eval.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/upload-artifact@v7.0.2'
-        - 'ai-action/setup-ollama@v2.1.18'
+        - 'ai-action/setup-ollama@v2.1.19'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/fuzz.yml':
         - 'actions/checkout@v7.0.1'
@@ -66,9 +66,9 @@ dependencies:
         commit: 'sha1-cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         owner_id: 44036562
         repo_id: 192625955
-    'ai-action/setup-ollama@v2.1.18':
-        ref: 'v2.1.18'
-        commit: 'sha1-798483f55e7466b967eee0627554aa3d0e0f3279'
+    'ai-action/setup-ollama@v2.1.19':
+        ref: 'v2.1.19'
+        commit: 'sha1-4d24ba3341d7b8e6ed2f80aa4ee53be6ee8e29fc'
         owner_id: 199858026
         repo_id: 935740819
     'docker/bake-action@v7.5.0':
