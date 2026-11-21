@@ -741,7 +741,8 @@ impl<A> SchemaCall<A> {
     ///
     /// Returns an error when the call fails, its answer was cut off, it
     /// produces nothing within the timeout, or the answer does not fit the
-    /// schema.
+    /// schema: rig checks the answer against the schema and asks once more
+    /// before failing the call, so a format retry is not ours to make.
     pub async fn answer(&self, text: &str) -> Result<A>
     where
         A: DeserializeOwned,

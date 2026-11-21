@@ -3495,7 +3495,7 @@ auth = "none"
 base_url = "http://localhost:11434"
 # max_concurrent_requests = 1          # model requests in flight at once; default 1 for Ollama, 8 otherwise
 # max_retries = 3                      # a 429, 5xx, or dropped connection is sent again this many times
-# retry_backoff_ms = 500               # the first wait; doubles each retry with jitter, a Retry-After header wins, 60 s at most
+# retry_backoff_ms = 500               # the first wait; doubles each retry with jitter, a wait the provider names wins, 60 s at most
 # temperature = false                  # send quack's temperature; default true for Ollama only
 # effort = "high"                      # this provider's models, over [analysis]; also background_effort
 

@@ -71,8 +71,10 @@ Three settings apply to every type:
   takes no headers, because the AWS SDK sends those requests.
 - `max_retries` (3) and `retry_backoff_ms` (500) say how a failed request is sent again: a
   429, a 5xx, or a connection that dropped before the response head is retried after the
-  wait, which doubles each time with up to 25% jitter and never exceeds 60 seconds; a
-  `Retry-After` header sets the wait when the provider sends one. A stream that fails after
+  wait, which doubles each time with up to 25% jitter and never exceeds 60 seconds; the
+  wait the provider names sets it instead when it is 60 seconds or less (`retry-after-ms`,
+  `Retry-After` in seconds or as an HTTP date, or a "try again in 2s" hint in the error
+  body, read by rig's `ErrorReport::retry_after`). A stream that fails after
   its head is not retried, since part of it was delivered. `max_retries = 0` sends once.
   Bedrock's `converse` API hands the same numbers to the AWS SDK's standard retry mode.
   Each retry counts in `quack_provider_retries_total` on `/metrics`.

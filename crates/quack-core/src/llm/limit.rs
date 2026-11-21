@@ -24,10 +24,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures::Stream;
+use rig::ProviderError;
 use rig::http_client::{
     self, BoxedStream, HttpClientExt, LazyBody, MultipartForm, Request, ReqwestClient, Response,
     StreamingResponse,
@@ -215,38 +216,43 @@ impl Attempts {
     }
 
     /// Whether `status` is worth another attempt, and how long to wait
-    /// first: `Retry-After` in seconds when the response names it, else
-    /// the policy's backoff for retry `attempt`. `None` when the response
-    /// stands (a success, a client error) or the attempts are used up.
+    /// first: the wait the provider named (rig's
+    /// [`ErrorReport::retry_after`](rig::error::ErrorReport::retry_after):
+    /// `retry-after-ms`, `Retry-After` in seconds or as a date, or a hint in
+    /// the error `body`) when it is at most a minute, else the policy's
+    /// backoff for retry `attempt`. `None` when the response stands (a
+    /// success, a client error) or the attempts are used up.
     fn wait_for_status(
         &self,
         attempt: u32,
         status: http::StatusCode,
         headers: &http::HeaderMap,
+        body: &str,
     ) -> Option<Duration> {
         if attempt >= self.policy.max_retries
             || !rig::error::retryable_status(Some(status.as_u16()))
         {
             return None;
         }
-        let named = headers
-            .get(http::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
+        let named = ProviderError::from_http_response(status, body)
+            .with_response_headers(Some(headers.clone()))
+            .report()
+            .retry_after(SystemTime::now())
             .filter(|d| *d <= RetryPolicy::MAX_WAIT);
         Some(named.unwrap_or_else(|| self.policy.next_wait(attempt.saturating_add(1))))
     }
 
     /// Whether a failure is worth another attempt, and the wait: a failing
-    /// status (rig's client turns one into an error, headers kept) as for
-    /// a response, a dropped transport by the backoff.
+    /// status (rig's client turns one into an error, headers and body kept)
+    /// as for a response, a dropped transport by the backoff.
     fn wait_for_error(&self, attempt: u32, error: &http_client::Error) -> Option<Duration> {
         if let http_client::Error::InvalidStatusCodeWithDetails {
-            status, headers, ..
+            status,
+            headers,
+            body,
         } = error
         {
-            return self.wait_for_status(attempt, *status, headers);
+            return self.wait_for_status(attempt, *status, headers, body);
         }
         if attempt >= self.policy.max_retries || !error.is_transient() {
             return None;
@@ -556,9 +562,9 @@ impl HttpClientExt for LimitedHttp {
                             status.as_str(),
                             started.elapsed(),
                         );
-                        let again = attempts
-                            .as_ref()
-                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let again = attempts.as_ref().and_then(|a| {
+                            a.wait_for_status(attempt, status, response.headers(), "")
+                        });
                         let Some(wait) = again else {
                             return Ok(body_holding(response, permit));
                         };
@@ -669,9 +675,9 @@ impl HttpClientExt for LimitedHttp {
                             status.as_str(),
                             started.elapsed(),
                         );
-                        let again = attempts
-                            .as_ref()
-                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let again = attempts.as_ref().and_then(|a| {
+                            a.wait_for_status(attempt, status, response.headers(), "")
+                        });
                         let Some(wait) = again else {
                             return Ok(response.map(|stream| -> BoxedStream {
                                 Box::pin(Holding {

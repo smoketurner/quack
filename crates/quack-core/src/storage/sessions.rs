@@ -870,21 +870,8 @@ pub trait SpokenText {
 impl SpokenText for Message {
     fn spoken_text(&self) -> String {
         match self {
-            Self::User { content } => content
-                .iter()
-                .filter_map(|part| match part {
-                    UserContent::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            Self::Assistant(turn) => turn
-                .content
-                .iter()
-                .filter_map(|part| match part {
-                    AssistantContent::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect(),
+            Self::User { content } => content.iter().filter_map(UserContent::as_text).collect(),
+            Self::Assistant(turn) => AssistantContent::concat_text(&turn.content),
             Self::System { content } => content.clone(),
         }
     }

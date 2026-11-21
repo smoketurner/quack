@@ -697,7 +697,9 @@ pub struct ProviderConfig {
 /// `max_retries` and `retry_backoff_ms` on `[providers.NAME]`: a request
 /// that the provider throttles (429), times out (408), or fails on its
 /// side (5xx), or whose transport drops, is sent again up to `max_retries`
-/// more times, waiting `Retry-After` when the response names it, else
+/// more times, waiting what the provider names (`retry-after-ms`,
+/// `Retry-After` in seconds or as a date, or a "try again in" hint in the
+/// error body) when it is at most a minute, else
 /// `backoff` doubled per attempt with jitter. Every provider type takes
 /// the same policy, Bedrock's SDK included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
