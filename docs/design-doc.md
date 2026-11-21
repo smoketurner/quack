@@ -2257,8 +2257,8 @@ message.
 - History sent to the model is trimmed to `history_token_budget` (32,000), oldest first. Tool
   messages are never replayed; only user and assistant text goes back. It loads through
   `llm::memory::History`: `storage::sessions::session_turns` reads the session's turns, and
-  `TranscriptWindow` is rig-memory's `recent::TokenBudget` at four characters per token that
-  also drops an answer whose question fell outside. The turns it leaves out are not replayed and
+  `TranscriptWindow` is a rig-memory `recent::Recent` at four characters per token, walked
+  through `recent::view` so no result loses its call, that also drops an answer whose question fell outside. The turns it leaves out are not replayed and
   nothing summarizes them; a turn's load calls no model. A file from a quack that kept
   summaries has its `_quack_session_summaries` dropped on open.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and
@@ -3495,7 +3495,7 @@ auth = "none"
 base_url = "http://localhost:11434"
 # max_concurrent_requests = 1          # model requests in flight at once; default 1 for Ollama, 8 otherwise
 # max_retries = 3                      # a 429, 5xx, or dropped connection is sent again this many times
-# retry_backoff_ms = 500               # the first wait; doubles each retry with jitter, a Retry-After header wins, 60 s at most
+# retry_backoff_ms = 500               # the first wait; doubles each retry with jitter, a wait the provider names wins, 60 s at most
 # temperature = false                  # send quack's temperature; default true for Ollama only
 # effort = "high"                      # this provider's models, over [analysis]; also background_effort
 

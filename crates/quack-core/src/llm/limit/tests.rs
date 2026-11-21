@@ -66,7 +66,7 @@ async fn call(client: LimitedHttp, url: String, body: &'static str) -> Bytes {
         .body(Bytes::from_static(body.as_bytes()))
         .unwrap_or_else(|e| fail(&e.to_string()));
     // The gates read the scope when `send` is called, so call it inside.
-    let sent = async { client.send::<_, Bytes>(request).await };
+    let sent = async { client.send(request).await };
     let response = Egress::scope(Some(Egress::NoWorkspace), sent)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -138,7 +138,7 @@ async fn a_request_the_scope_refuses_is_never_sent() {
             .body(Bytes::from_static(body.as_bytes()))
             .unwrap_or_else(|e| fail(&e.to_string()));
         async move {
-            let sent = async { client.send::<_, Bytes>(request).await };
+            let sent = async { client.send(request).await };
             match Egress::scope(egress, sent).await {
                 Ok(_) => String::from("sent"),
                 Err(e) => e.to_string(),
@@ -340,7 +340,7 @@ async fn status_of(client: LimitedHttp, url: String) -> Result<u16, String> {
     let request = Request::post(url)
         .body(Bytes::from_static(br#"{"model":"m"}"#))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let sent = async { client.send::<_, Bytes>(request).await };
+    let sent = async { client.send(request).await };
     Egress::scope(Some(Egress::NoWorkspace), sent)
         .await
         .map(|r| r.status().as_u16())
@@ -421,17 +421,46 @@ fn the_wait_doubles_with_jitter_and_stops_at_a_minute() {
         http::header::RETRY_AFTER,
         http::HeaderValue::from_static("7"),
     );
+    let too_many = http::StatusCode::TOO_MANY_REQUESTS;
     assert_eq!(
-        attempts.wait_for_status(0, http::StatusCode::TOO_MANY_REQUESTS, &headers),
+        attempts.wait_for_status(0, too_many, &headers, ""),
         Some(Duration::from_secs(7))
     );
+    assert_eq!(attempts.wait_for_status(3, too_many, &headers, ""), None);
     assert_eq!(
-        attempts.wait_for_status(3, http::StatusCode::TOO_MANY_REQUESTS, &headers),
+        attempts.wait_for_status(0, http::StatusCode::BAD_REQUEST, &headers, ""),
         None
     );
+}
+
+/// The other forms a provider names its wait in, read by rig's
+/// `ErrorReport::retry_after`; a wait over a minute falls back to the backoff.
+#[test]
+fn the_wait_a_provider_names_is_read_in_every_form() {
+    let policy = RetryPolicy {
+        max_retries: 3,
+        backoff: Duration::from_millis(500),
+    };
+    let attempts = Attempts::new(&name("p"), policy);
+    let too_many = http::StatusCode::TOO_MANY_REQUESTS;
+    let header = |name: &'static str, value: &'static str| {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(name, http::HeaderValue::from_static(value));
+        headers
+    };
     assert_eq!(
-        attempts.wait_for_status(0, http::StatusCode::BAD_REQUEST, &headers),
-        None
+        attempts.wait_for_status(0, too_many, &header("retry-after-ms", "1500"), ""),
+        Some(Duration::from_millis(1500))
+    );
+    let body = r#"{"error":{"message":"Rate limit reached. Please try again in 2.5s."}}"#;
+    assert_eq!(
+        attempts.wait_for_status(0, too_many, &http::HeaderMap::new(), body),
+        Some(Duration::from_millis(2500))
+    );
+    let backoff = attempts.wait_for_status(0, too_many, &header("retry-after", "600"), "");
+    assert!(
+        backoff.is_some_and(|d| d <= Duration::from_millis(625)),
+        "{backoff:?}"
     );
 }
 

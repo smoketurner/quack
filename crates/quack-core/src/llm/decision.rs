@@ -13,6 +13,7 @@
 //! cutting it. [`Asker::ask`] therefore sends a row's whole state first and
 //! cuts it only after a refusal, so [`Answers::truncated`] is exact.
 
+use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
@@ -966,13 +967,13 @@ impl Asker<'_> {
         let endpoint = &self.model.endpoint;
         let request = endpoint
             .request(http::Method::POST, "v1/systemone")
-            .body(body)
+            .body(Bytes::from(body))
             .map_err(|e| Error::Llm(e.to_string()))?;
-        let sent = endpoint.http.send::<_, Vec<u8>>(request).await;
+        let sent = endpoint.http.send(request).await;
         match sent {
             Ok(response) => {
                 let status = response.status();
-                let bytes: Vec<u8> = response
+                let bytes: Bytes = response
                     .into_body()
                     .await
                     .map_err(|e| Error::Llm(format!("ollama: {e}")))?;
@@ -982,8 +983,8 @@ impl Asker<'_> {
                 Reply::from_status(status, body.as_bytes())
             }
             // A provider-list refusal surfaces from the request gate as an
-            // instance error: hand it back typed.
-            Err(http_client::Error::Instance(source)) => Err(match source.downcast::<Error>() {
+            // permanent error: hand it back typed.
+            Err(http_client::Error::Permanent(source)) => Err(match source.downcast::<Error>() {
                 Ok(error) => *error,
                 Err(source) => Error::Llm(format!("ollama: {source}")),
             }),

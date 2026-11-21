@@ -24,10 +24,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures::Stream;
+use rig::ProviderError;
 use rig::http_client::{
     self, BoxedStream, HttpClientExt, LazyBody, MultipartForm, Request, ReqwestClient, Response,
     StreamingResponse,
@@ -215,40 +216,45 @@ impl Attempts {
     }
 
     /// Whether `status` is worth another attempt, and how long to wait
-    /// first: `Retry-After` in seconds when the response names it, else
-    /// the policy's backoff for retry `attempt`. `None` when the response
-    /// stands (a success, a client error) or the attempts are used up.
+    /// first: the wait the provider named (rig's
+    /// [`ErrorReport::retry_after`](rig::error::ErrorReport::retry_after):
+    /// `retry-after-ms`, `Retry-After` in seconds or as a date, or a hint in
+    /// the error `body`) when it is at most a minute, else the policy's
+    /// backoff for retry `attempt`. `None` when the response stands (a
+    /// success, a client error) or the attempts are used up.
     fn wait_for_status(
         &self,
         attempt: u32,
         status: http::StatusCode,
         headers: &http::HeaderMap,
+        body: &str,
     ) -> Option<Duration> {
         if attempt >= self.policy.max_retries
             || !rig::error::retryable_status(Some(status.as_u16()))
         {
             return None;
         }
-        let named = headers
-            .get(http::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
+        let named = ProviderError::from_http_response(status, body)
+            .with_response_headers(Some(headers.clone()))
+            .report()
+            .retry_after(SystemTime::now())
             .filter(|d| *d <= RetryPolicy::MAX_WAIT);
         Some(named.unwrap_or_else(|| self.policy.next_wait(attempt.saturating_add(1))))
     }
 
     /// Whether a failure is worth another attempt, and the wait: a failing
-    /// status (rig's client turns one into an error, headers kept) as for
-    /// a response, a dropped transport by the backoff.
+    /// status (rig's client turns one into an error, headers and body kept)
+    /// as for a response, a dropped transport by the backoff.
     fn wait_for_error(&self, attempt: u32, error: &http_client::Error) -> Option<Duration> {
         if let http_client::Error::InvalidStatusCodeWithDetails {
-            status, headers, ..
+            status,
+            headers,
+            body,
         } = error
         {
-            return self.wait_for_status(attempt, *status, headers);
+            return self.wait_for_status(attempt, *status, headers, body);
         }
-        if attempt >= self.policy.max_retries || !rig::error::transient_transport(error) {
+        if attempt >= self.policy.max_retries || !error.is_transient() {
             return None;
         }
         Some(self.policy.next_wait(attempt.saturating_add(1)))
@@ -465,11 +471,8 @@ impl LimitedHttp {
 }
 
 /// Hold `permit` until the lazily read body has been read (or dropped).
-fn body_holding<U: Send + 'static>(
-    response: Response<LazyBody<U>>,
-    permit: Option<GatePermit>,
-) -> Response<LazyBody<U>> {
-    response.map(|body| -> LazyBody<U> {
+fn body_holding(response: Response<LazyBody>, permit: Option<GatePermit>) -> Response<LazyBody> {
+    response.map(|body| -> LazyBody {
         Box::pin(async move {
             let read = body.await;
             drop(permit);
@@ -524,19 +527,13 @@ impl Blueprint {
 }
 
 impl HttpClientExt for LimitedHttp {
-    fn send<T, U>(
+    fn send(
         &self,
-        req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
-    where
-        T: Into<Bytes> + Send,
-        U: From<Bytes> + Send + 'static,
-    {
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
         let inner = self.inner.clone();
-        // Read the body now: `T` need not outlive this call, and the gate
-        // is chosen by the model it names.
+        // The gate is chosen by the model the body names.
         let (parts, body) = req.into_parts();
-        let body: Bytes = body.into();
         let model = GateKey::model_of(&body);
         let permit = self.gates.permit(model.clone());
         let gates = self.gates.clone();
@@ -544,9 +541,11 @@ impl HttpClientExt for LimitedHttp {
         let headers = self.headers.clone();
         let attempts = self.attempts.clone();
         let provider = self.provider_name();
-        async move {
+        // Boxed: the attempt loop holds the inner transport's send, whose
+        // future is large enough to bloat every caller's.
+        Box::pin(async move {
             let waited = Instant::now();
-            let mut permit = permit.await.map_err(http_client::Error::instance)?;
+            let mut permit = permit.await.map_err(http_client::Error::permanent)?;
             telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
             let blueprint = Blueprint { parts, body };
             let mut attempt = 0_u32;
@@ -563,9 +562,9 @@ impl HttpClientExt for LimitedHttp {
                             status.as_str(),
                             started.elapsed(),
                         );
-                        let again = attempts
-                            .as_ref()
-                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let again = attempts.as_ref().and_then(|a| {
+                            a.wait_for_status(attempt, status, response.headers(), "")
+                        });
                         let Some(wait) = again else {
                             return Ok(body_holding(response, permit));
                         };
@@ -579,7 +578,7 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                     Err(error) => {
                         telemetry::provider_request(
@@ -604,21 +603,18 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                 }
                 attempt = attempt.saturating_add(1);
             }
-        }
+        })
     }
 
-    fn send_multipart<U>(
+    fn send_multipart(
         &self,
         mut req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
-    where
-        U: From<Bytes> + Send + 'static,
-    {
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
         let inner = self.inner.clone();
         let permit = self.gates.permit(None);
         let authorize = self.authorize.clone();
@@ -627,8 +623,8 @@ impl HttpClientExt for LimitedHttp {
             match authorize {
                 // SigV4 signs the body, and a multipart body is not built yet.
                 Some(Authorize::Sign(_)) => {
-                    return Err(http_client::Error::Instance(
-                        "multipart requests cannot be SigV4-signed".into(),
+                    return Err(http_client::Error::permanent(
+                        "multipart requests cannot be SigV4-signed",
                     ));
                 }
                 Some(Authorize::Bearer(value)) => {
@@ -636,7 +632,7 @@ impl HttpClientExt for LimitedHttp {
                 }
                 None => {}
             }
-            let permit = permit.await.map_err(http_client::Error::instance)?;
+            let permit = permit.await.map_err(http_client::Error::permanent)?;
             let response = inner.send_multipart(req).await?;
             Ok(body_holding(response, permit))
         }
@@ -645,16 +641,12 @@ impl HttpClientExt for LimitedHttp {
     /// A streamed request is tried again only until its head arrives:
     /// once the response status is good, the stream is the model's answer
     /// and a break in it ends the turn rather than restarting it.
-    fn send_streaming<T>(
+    fn send_streaming(
         &self,
-        req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
-    where
-        T: Into<Bytes> + Send,
-    {
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
-        let body: Bytes = body.into();
         let model = GateKey::model_of(&body);
         let permit = self.gates.permit(model.clone());
         let gates = self.gates.clone();
@@ -662,9 +654,11 @@ impl HttpClientExt for LimitedHttp {
         let headers = self.headers.clone();
         let attempts = self.attempts.clone();
         let provider = self.provider_name();
-        async move {
+        // Boxed: the attempt loop holds the inner transport's send, whose
+        // future is large enough to bloat every caller's.
+        Box::pin(async move {
             let waited = Instant::now();
-            let mut permit = permit.await.map_err(http_client::Error::instance)?;
+            let mut permit = permit.await.map_err(http_client::Error::permanent)?;
             telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
             let blueprint = Blueprint { parts, body };
             let mut attempt = 0_u32;
@@ -681,9 +675,9 @@ impl HttpClientExt for LimitedHttp {
                             status.as_str(),
                             started.elapsed(),
                         );
-                        let again = attempts
-                            .as_ref()
-                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let again = attempts.as_ref().and_then(|a| {
+                            a.wait_for_status(attempt, status, response.headers(), "")
+                        });
                         let Some(wait) = again else {
                             return Ok(response.map(|stream| -> BoxedStream {
                                 Box::pin(Holding {
@@ -702,7 +696,7 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                     Err(error) => {
                         telemetry::provider_request(
@@ -727,12 +721,12 @@ impl HttpClientExt for LimitedHttp {
                         permit = gates
                             .permit(model.clone())
                             .await
-                            .map_err(http_client::Error::instance)?;
+                            .map_err(http_client::Error::permanent)?;
                     }
                 }
                 attempt = attempt.saturating_add(1);
             }
-        }
+        })
     }
 }
 
