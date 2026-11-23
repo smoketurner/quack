@@ -204,10 +204,9 @@ fn answer(
         }
         "/token" => {
             state.token_bodies.push(body.to_owned());
-            let form: HashMap<String, String> =
-                oauth2::url::form_urlencoded::parse(body.as_bytes())
-                    .into_owned()
-                    .collect();
+            let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+                .into_owned()
+                .collect();
             match form.get("grant_type").map(String::as_str) {
                 Some("authorization_code") => {
                     let mut token = json!({
@@ -249,7 +248,7 @@ fn refuse_assertion(
     base: &str,
     state: &mut IssuerState,
 ) -> Option<(&'static str, Value)> {
-    let form: HashMap<String, String> = oauth2::url::form_urlencoded::parse(body.as_bytes())
+    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
         .into_owned()
         .collect();
     let assertion = form.get("client_assertion")?;
@@ -770,7 +769,7 @@ impl MockIssuer {
             s.par_bodies
                 .iter()
                 .map(|b| {
-                    oauth2::url::form_urlencoded::parse(b.as_bytes())
+                    url::form_urlencoded::parse(b.as_bytes())
                         .into_owned()
                         .collect()
                 })

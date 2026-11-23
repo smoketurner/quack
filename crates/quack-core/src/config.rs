@@ -1497,7 +1497,7 @@ impl OidcConfig {
     /// Whether `redirect_uri`, and so the server's public URL, is https.
     #[must_use]
     pub fn is_https(&self) -> bool {
-        oauth2::url::Url::parse(&self.redirect_uri).is_ok_and(|url| url.scheme() == "https")
+        url::Url::parse(&self.redirect_uri).is_ok_and(|url| url.scheme() == "https")
     }
 
     /// The scopes requested when `scopes` is unset.
@@ -1545,7 +1545,7 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
                 "[server.oidc].scopes must include \"openid\"",
             )));
         }
-        let redirect = oauth2::url::Url::parse(&raw.redirect_uri).map_err(|e| {
+        let redirect = url::Url::parse(&raw.redirect_uri).map_err(|e| {
             Error::Config(format!(
                 "[server.oidc].redirect_uri '{}' is not a URL: {e}",
                 raw.redirect_uri
