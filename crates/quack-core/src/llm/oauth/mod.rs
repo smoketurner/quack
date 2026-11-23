@@ -1089,6 +1089,16 @@ impl TokenManager {
                 .delegated
                 .lock()
                 .map_err(|e| Error::Llm(format!("delegated tokens poisoned: {e}")))?;
+            // Every signed-in person who reaches the provider leaves an entry,
+            // and API callers never log out: an expired one nobody holds goes.
+            let now = Timestamp::now();
+            delegated.retain(|_, slot| {
+                Arc::strong_count(slot) > 1
+                    || slot.try_lock().map_or(true, |held| {
+                        held.as_ref()
+                            .is_some_and(|d| d.token.is_fresh(now, SignedDuration::ZERO))
+                    })
+            });
             Arc::clone(delegated.entry(acting.user().clone()).or_default())
         };
         let mut held = entry.lock().await;
