@@ -70,8 +70,8 @@ use super::api::members::{AddMember, GroupRole};
 use super::api::ontology::{DecideRequest, RenameRequest};
 use super::api::workspaces::CreateWorkspace;
 use super::api::{documents as docs_api, graph as graph_api, import as import_api};
-use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
-use super::error::ApiError;
+use super::auth::{Access, Audit, Identity, Need, Peer, RequestId, SessionCookie, password_login};
+use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
 use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
@@ -128,9 +128,21 @@ impl From<CoreError> for HtmlError {
     }
 }
 
+impl From<HtmlError> for ApiError {
+    fn from(err: HtmlError) -> Self {
+        err.0
+    }
+}
+
+impl From<askama::Error> for ApiError {
+    fn from(err: askama::Error) -> Self {
+        Self::internal(format!("template error: {err}"))
+    }
+}
+
 impl From<askama::Error> for HtmlError {
     fn from(err: askama::Error) -> Self {
-        Self(ApiError::internal(format!("template error: {err}")))
+        Self(ApiError::from(err))
     }
 }
 
@@ -720,11 +732,22 @@ impl TablesPage {
             }
             Some(view)
         } else {
-            access.audit_read(app, AuditAction::Page, "tables").await?;
             None
         };
-        let list = app.read(id, WorkspaceDb::list_tables).await?;
-        let imports = app.read(id, SavedImport::list).await?;
+        let loading = async {
+            Ok::<_, ApiError>((
+                app.read(id, WorkspaceDb::list_tables).await?,
+                app.read(id, SavedImport::list).await?,
+            ))
+        };
+        // Describing a table audits itself as opening it.
+        let (list, imports) = if selected.is_some() {
+            loading.await?
+        } else {
+            access
+                .audited(app, Audit::read(AuditAction::Page, "tables"), loading)
+                .await?
+        };
         let mut page = Page::in_workspace(app, Tab::Tables, &access);
         if let Some(table) = &selected {
             page.title.clone_from(&table.name);
@@ -1408,31 +1431,33 @@ async fn chat(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let viewer = access.session_viewer();
     let wanted = q.session.clone().map(SessionId::from);
-    let (sessions_list, current, messages) = app
-        .read(&id, move |db| {
-            let list = sessions::list_sessions_for(db, 50, &viewer)?;
-            let current = match wanted {
-                Some(id) => sessions::get_session(db, &id)?.filter(|s| s.visible_to(&viewer)),
-                None => None,
-            };
-            let messages = match &current {
-                Some(s) => sessions::messages(db, &s.id)?,
-                None => Vec::new(),
-            };
-            Ok((list, current, messages))
+    // Only opening a session is audited when the read works; a failed read
+    // is recorded either way.
+    let (sessions_list, current, messages) = access
+        .audited_with(&app, Audit::of(AuditAction::SessionRead), async |audit| {
+            let read = app
+                .read(&id, move |db| {
+                    let list = sessions::list_sessions_for(db, 50, &viewer)?;
+                    let current = match wanted {
+                        Some(id) => {
+                            sessions::get_session(db, &id)?.filter(|s| s.visible_to(&viewer))
+                        }
+                        None => None,
+                    };
+                    let messages = match &current {
+                        Some(s) => sessions::messages(db, &s.id)?,
+                        None => Vec::new(),
+                    };
+                    Ok((list, current, messages))
+                })
+                .await?;
+            match &read.1 {
+                Some(current) => audit.set_resource(ResourceKind::Session, current.id.as_str()),
+                None => audit.already_recorded(),
+            }
+            Ok(read)
         })
         .await?;
-    if let Some(current) = &current {
-        access
-            .audit(
-                &app,
-                AuditAction::SessionRead,
-                Some(ResourceKind::Session.id(&current.id)),
-                Outcome::Allowed,
-                None,
-            )
-            .await?;
-    }
     // The empty state says what there is to ask about.
     let (tables, (documents, documents_total)) = if messages.is_empty() {
         app.read(&id, |db| {
@@ -1631,8 +1656,11 @@ async fn jobs_page(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "jobs").await?;
-    let rows = JobRows::of(&app, &access).render()?;
+    let rows = access
+        .audited(&app, Audit::read(AuditAction::Page, "jobs"), async {
+            Ok(JobRows::of(&app, &access).render()?)
+        })
+        .await?;
     html(&JobsPage {
         page: Page::in_workspace(&app, Tab::Jobs, &access),
         rows,
@@ -1645,10 +1673,12 @@ async fn job_rows(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "job_rows")
+    let rows = access
+        .audited(&app, Audit::read(AuditAction::Page, "job_rows"), async {
+            Ok(JobRows::of(&app, &access).render()?)
+        })
         .await?;
-    Ok(Html(JobRows::of(&app, &access).render()?).into_response())
+    Ok(Html(rows).into_response())
 }
 
 /// The strip above every workspace page, refetched on each job event.
@@ -1658,10 +1688,12 @@ async fn job_strip(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "jobs_strip")
+    let strip = access
+        .audited(&app, Audit::read(AuditAction::Page, "jobs_strip"), async {
+            Ok(JobStrip::of(&app, &access).render()?)
+        })
         .await?;
-    Ok(Html(JobStrip::of(&app, &access).render()?).into_response())
+    Ok(Html(strip).into_response())
 }
 
 async fn job_cancel(
@@ -1683,13 +1715,15 @@ async fn documents(
     flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "documents")
+    let (rows, embeddings_note) = access
+        .audited(&app, Audit::read(AuditAction::Page, "documents"), async {
+            let rows = DocumentRows::load(&app, &access, query.listing())
+                .await?
+                .render()?;
+            let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
+            Ok((rows, embeddings_note))
+        })
         .await?;
-    let rows = DocumentRows::load(&app, &access, query.listing())
-        .await?
-        .render()?;
-    let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
         page: Page::in_workspace(&app, Tab::Documents, &access),
         rows,
@@ -1755,15 +1789,20 @@ async fn document_rows(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "document_rows")
+    let rows = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::Page, "document_rows"),
+            async {
+                Ok(
+                    DocumentRows::load(&app, &access, DocumentListing::default())
+                        .await?
+                        .render()?,
+                )
+            },
+        )
         .await?;
-    Ok(Html(
-        DocumentRows::load(&app, &access, DocumentListing::default())
-            .await?
-            .render()?,
-    )
-    .into_response())
+    Ok(Html(rows).into_response())
 }
 
 async fn document_status(
@@ -1772,13 +1811,19 @@ async fn document_status(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "document_status")
+    let statuses = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::Page, "document_status"),
+            async {
+                let DocumentRows {
+                    documents, pending, ..
+                } = DocumentRows::load(&app, &access, DocumentListing::default()).await?;
+                Ok(DocumentStatuses { documents, pending }.render()?)
+            },
+        )
         .await?;
-    let DocumentRows {
-        documents, pending, ..
-    } = DocumentRows::load(&app, &access, DocumentListing::default()).await?;
-    Ok(Html(DocumentStatuses { documents, pending }.render()?).into_response())
+    Ok(Html(statuses).into_response())
 }
 
 async fn upload(
@@ -2093,7 +2138,11 @@ async fn sql_page(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "sql").await?;
+    access
+        .audited(&app, Audit::read(AuditAction::Page, "sql"), async {
+            Ok(())
+        })
+        .await?;
     html(&SqlPage {
         page: Page::in_workspace(&app, Tab::Sql, &access),
         sql: String::new(),
@@ -2220,29 +2269,27 @@ async fn ontology_page(
     flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "ontology")
-        .await?;
     let queue_status = q.status.unwrap_or_default();
-    let (ontology, versions, diff, pending, low_support, tables) = app
-        .read(&id, |db| {
-            let current = ontology_store::current(db)?;
-            let versions = ontology_store::versions(db, 20)?;
-            let previous = current
-                .as_ref()
-                .and_then(|c| c.version)
-                .and_then(OntologyVersion::previous);
-            let diff = match (&current, previous) {
-                (Some(c), Some(previous)) => {
-                    ontology_store::version(db, previous)?.map(|older| c.diff(&older))
-                }
-                (Some(_) | None, None) | (None, Some(_)) => None,
-            };
-            let pending = candidates::queue(db, Queue::Pending)?;
-            let low_support = candidates::queue(db, Queue::LowSupport)?;
-            let tables = db.list_tables()?;
-            Ok((current, versions, diff, pending, low_support, tables))
-        })
+    let reading = app.read(&id, |db| {
+        let current = ontology_store::current(db)?;
+        let versions = ontology_store::versions(db, 20)?;
+        let previous = current
+            .as_ref()
+            .and_then(|c| c.version)
+            .and_then(OntologyVersion::previous);
+        let diff = match (&current, previous) {
+            (Some(c), Some(previous)) => {
+                ontology_store::version(db, previous)?.map(|older| c.diff(&older))
+            }
+            (Some(_) | None, None) | (None, Some(_)) => None,
+        };
+        let pending = candidates::queue(db, Queue::Pending)?;
+        let low_support = candidates::queue(db, Queue::LowSupport)?;
+        let tables = db.list_tables()?;
+        Ok((current, versions, diff, pending, low_support, tables))
+    });
+    let (ontology, versions, diff, pending, low_support, tables) = access
+        .audited(&app, Audit::read(AuditAction::Page, "ontology"), reading)
         .await?;
     let (pending_total, low_support_total) = (pending.len(), low_support.len());
     let rows = match queue_status {
@@ -2673,13 +2720,14 @@ async fn context_page(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "context")
-        .await?;
-    let (current, versions) = app
-        .read(&id, |db| {
-            Ok((context::current(db)?, context::history(db, 20)?))
-        })
+    let (current, versions) = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::Page, "context"),
+            app.read(&id, |db| {
+                Ok((context::current(db)?, context::history(db, 20)?))
+            }),
+        )
         .await?;
     html(&ContextPage {
         page: Page::in_workspace(&app, Tab::Context, &access),
@@ -2765,10 +2813,12 @@ async fn settings(
     flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
-    access
-        .audit_read(&app, AuditAction::Page, "settings")
+    let page = access
+        .audited(&app, Audit::read(AuditAction::Page, "settings"), async {
+            Ok(SettingsPage::load(&app, &access, None, flash.error()).await?)
+        })
         .await?;
-    html(&SettingsPage::load(&app, &access, None, flash.error()).await?)
+    html(&page)
 }
 
 #[derive(Deserialize)]
@@ -2915,24 +2965,32 @@ async fn token_create(
         );
     }
     let scopes = form.scopes;
-    let expires_at = form
-        .expires_days
-        .filter(|d| *d > 0)
-        .map(Expiry::after_days)
-        .transpose()?;
-    let entry = access.entry(AuditAction::Token, Outcome::Allowed);
-    let IssuedToken { secret, .. } = app
-        .control
-        .create_token(
-            &id,
-            &access.identity.user_id,
-            form.name.trim(),
-            &scopes,
-            expires_at,
-            entry.clone(),
-        )
+    // The token commits with its access row, so the work writes that row
+    // itself; this records a request that fails before then.
+    let secret = access
+        .audited_with(&app, Audit::of(AuditAction::Token), async |audit| {
+            let expires_at = form
+                .expires_days
+                .filter(|d| *d > 0)
+                .map(Expiry::after_days)
+                .transpose()?;
+            let entry = access.committed_entry(AuditAction::Token);
+            let IssuedToken { secret, .. } = app
+                .control
+                .create_token(
+                    &id,
+                    &access.identity.user_id,
+                    form.name.trim(),
+                    &scopes,
+                    expires_at,
+                    entry.clone(),
+                )
+                .await?;
+            audit.already_recorded();
+            access.record_detail(&app, &entry, None).await?;
+            Ok(secret)
+        })
         .await?;
-    access.record_detail(&app, &entry, None).await?;
     // The secret is shown once in this response body, never in a URL where
     // browser history, proxy logs, or a Referer would keep it.
     html(&SettingsPage::load(&app, &access, Some(secret.expose().to_owned()), None).await?)
@@ -2944,18 +3002,24 @@ async fn token_revoke(
     Path((id, hash)): Path<(WorkspaceId, String)>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
-    let owned = app
-        .control
-        .list_tokens(&id)
-        .await?
-        .into_iter()
-        .any(|t| t.token_hash == hash);
-    if !owned {
-        return Err(ApiError::not_found("no such token").into());
-    }
-    let entry = access.entry(AuditAction::Token, Outcome::Allowed);
-    app.control.delete_token(&hash, entry.clone()).await?;
-    access.record_detail(&app, &entry, None).await?;
+    access
+        .audited_with(&app, Audit::of(AuditAction::Token), async |audit| {
+            let owned = app
+                .control
+                .list_tokens(&id)
+                .await?
+                .into_iter()
+                .any(|t| t.token_hash == hash);
+            if !owned {
+                return Err(ApiError::not_found("no such token"));
+            }
+            let entry = access.committed_entry(AuditAction::Token);
+            app.control.delete_token(&hash, entry.clone()).await?;
+            audit.already_recorded();
+            access.record_detail(&app, &entry, None).await?;
+            Ok(())
+        })
+        .await?;
     Ok(Redirect::to(&format!("/w/{id}/settings")).into_response())
 }
 
@@ -3152,12 +3216,14 @@ async fn render_graph(
     flash: &Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(app, identity, id, Need::READ).await?;
-    access.audit_read(app, AuditAction::Page, "graph").await?;
     let options = app.engine.config.graph;
     let query = GraphQueryView::from_query(q);
-    let ask = GraphAsk::of(q, app, &access).await?;
-    let data = app
-        .read(id, move |db| GraphPageData::read(db, &ask, &options))
+    let data = access
+        .audited(app, Audit::read(AuditAction::Page, "graph"), async {
+            let ask = GraphAsk::of(q, app).await?;
+            app.read(id, move |db| GraphPageData::read(db, &ask, &options))
+                .await
+        })
         .await?;
     // An unknown class or entity is shown on the page, not as a failed page.
     let mut error = flash.error();
@@ -3214,19 +3280,13 @@ enum GraphAsk {
 impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
-    async fn of(q: &GraphSearch, app: &App, access: &Access) -> WebResult<Self> {
+    async fn of(q: &GraphSearch, app: &App) -> ApiResult<Self> {
         let path = q.path().query();
         let search = q.search().query();
         if path.is_err() && search.is_err() {
             return Ok(Self::Nothing);
         }
-        let model = access
-            .model(
-                app,
-                AuditAction::Graph,
-                Embeddings::from_config(&app.engine.config).await,
-            )
-            .await?;
+        let model = Embeddings::from_config(&app.engine.config).await?;
         Ok(match (path, search) {
             (Ok(path), _) => {
                 let ends = path.embeddings(model.as_ref()).await?;

@@ -169,6 +169,17 @@ pub(crate) struct McpKey {
 pub(crate) type App = Arc<AppState>;
 
 impl AppState {
+    /// Drop the stored sign-in token of a user whose last session ended. The
+    /// sessions are already closed and the cookie is cleared, so a failure
+    /// is logged instead of undoing the logout.
+    pub(crate) async fn forget_sign_in_token(&self, user: &UserId) {
+        if let Some(oidc) = &self.oidc
+            && let Err(e) = oidc.forget_unless_signed_in(user).await
+        {
+            tracing::error!(user = %user, error = %e.message, "could not drop the stored sign-in token at logout");
+        }
+    }
+
     pub(crate) fn new(
         engine: Arc<Engine>,
         control: ControlPlane,

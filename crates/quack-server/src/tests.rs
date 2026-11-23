@@ -67,6 +67,18 @@ fn fail(msg: &str) -> ! {
     panic!("{msg}")
 }
 
+/// How many of `rows` were allowed, denied, and errors: a request that fails
+/// after authorization leaves an error row, and one the caller may not make
+/// a denied one.
+fn tally(rows: &[AuditRow]) -> (usize, usize, usize) {
+    let count = |outcome| rows.iter().filter(|r| r.entry.outcome == outcome).count();
+    (
+        count(Outcome::Allowed),
+        count(Outcome::Denied),
+        count(Outcome::Error),
+    )
+}
+
 async fn harness(mode: ServeMode) -> Harness {
     harness_with(mode, Config::default()).await
 }
@@ -512,6 +524,189 @@ async fn login_sets_a_cookie_and_audits_both_outcomes() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = h.get("/api/v1/auth/me", &token).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// `POST /workspaces/{id}/members` returns `200` with `NewMember` for a new
+/// member and for a role change, so the race fix does not regress the happy
+/// path: the requested role is the role the database reflects.
+#[tokio::test(flavor = "multi_thread")]
+async fn add_member_returns_new_member_for_an_add_and_a_role_change() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let token = h.login("owner").await;
+
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &token,
+            serde_json::json!({ "username": "bob", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"].as_str(), Some(bob.as_str()), "{body}");
+    assert_eq!(body["username"], "bob", "{body}");
+    assert_eq!(body["role"], "viewer", "{body}");
+    assert!(
+        h.app
+            .control
+            .member_role(&ws, &bob)
+            .await
+            .is_ok_and(|r| r == Some(Role::Viewer)),
+        "bob is a viewer"
+    );
+
+    // A role change returns the new role and the database reflects it.
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &token,
+            serde_json::json!({ "username": "bob", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "owner", "{body}");
+    assert!(
+        h.app
+            .control
+            .member_role(&ws, &bob)
+            .await
+            .is_ok_and(|r| r == Some(Role::Owner)),
+        "bob is now an owner"
+    );
+}
+
+/// `POST /workspaces/{id}/members` answers `410 Gone` — never `200` with a
+/// role the database does not reflect — when the membership is removed
+/// between `set_member`'s read and its `UPDATE`. A second pool holds an
+/// uncommitted `DELETE` of the membership: in WAL the route's `member_role`
+/// read sees the member and takes the `UPDATE` branch, the `UPDATE` then
+/// waits on the write lock the delete holds, and once it commits the row is
+/// gone, so the `UPDATE` is a no-op, audited as `Error`, and the response is
+/// `Gone`. A bounded retry covers the scheduling case where the request
+/// runs entirely after the delete and re-inserts the member (`200`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_member_answers_gone_when_the_membership_is_removed_under_it() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let token = h.login("owner").await;
+    let url = format!(
+        "sqlite:{}",
+        h.app
+            .engine
+            .config
+            .general
+            .data_dir
+            .join("control.db")
+            .display()
+    );
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    let mut saw_gone = false;
+    for _ in 0..8 {
+        // Reset bob to a viewer so the request's read has a member to change.
+        let _: bool = h
+            .app
+            .control
+            .remove_member(&ws, &bob, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let added: bool = h
+            .app
+            .control
+            .set_member(&ws, &bob, Role::Viewer, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(added, "the reset viewer grant must take");
+
+        // Hold an uncommitted DELETE of bob's membership: the route's read
+        // sees the committed state (bob present), and its UPDATE waits on
+        // this write lock until the DELETE commits and the row is gone.
+        let mut held = pool.begin().await.unwrap_or_else(|e| fail(&e.to_string()));
+        sqlx::query("DELETE FROM members WHERE workspace_id = ? AND user_id = ?")
+            .bind(ws.as_str())
+            .bind(bob.as_str())
+            .execute(&mut *held)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let router = h.router.clone();
+        let path = format!("/api/v1/workspaces/{ws}/members");
+        let bearer = token.clone();
+        let inflight = tokio::spawn(async move {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "username": "bob", "role": "owner" }).to_string(),
+                ))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let response = router
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            });
+            (status, body)
+        });
+
+        // Let the request read `member_role` (WAL sees bob) and block on the
+        // held write lock at the UPDATE; the pool's busy timeout is 5 s, so
+        // this is well within the wait. Commit the delete; the blocked
+        // UPDATE now matches no row.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        held.commit().await.unwrap_or_else(|e| fail(&e.to_string()));
+
+        let (status, body) = inflight.await.unwrap_or_else(|e| fail(&e.to_string()));
+        if status == StatusCode::GONE {
+            saw_gone = true;
+            assert_eq!(body["code"], "gone", "{body}");
+            assert!(
+                h.app
+                    .control
+                    .member_role(&ws, &bob)
+                    .await
+                    .is_ok_and(|r| r.is_none()),
+                "bob must not be a member after the race: {body}"
+            );
+            let rows = h
+                .audit(AuditFilter {
+                    workspace_id: Some(ws.clone()),
+                    action: Some(String::from("member")),
+                    limit: 100,
+                    ..AuditFilter::default()
+                })
+                .await;
+            assert!(
+                rows.iter().any(|r| {
+                    r.entry.resource_id.as_deref() == Some(bob.as_str())
+                        && r.entry.outcome == Outcome::Error
+                }),
+                "the no-op add_member must be audited as Error: {rows:?}"
+            );
+            break;
+        }
+        // The request ran entirely after the delete committed: its read saw
+        // no member and it INSERTed bob back. The race did not land; reset
+        // and retry.
+        assert_eq!(status, StatusCode::OK, "unexpected status: {body}");
+    }
+    pool.close().await;
+    assert!(saw_gone, "the race never forced the no-op in 8 attempts");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2002,7 +2197,11 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(ingests.len(), 3, "the duplicate is audited too");
+    assert_eq!(
+        tally(&ingests),
+        (3, 0, 1),
+        "the duplicate is audited too, and so is the refused file: {ingests:?}"
+    );
     let deletes = h
         .audit(AuditFilter {
             workspace_id: Some(ws),
@@ -2674,7 +2873,11 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(shares.len(), 3, "two allowed and one denied");
+    assert_eq!(
+        tally(&shares),
+        (2, 1, 1),
+        "two allowed, one denied, and one for a session the caller cannot see: {shares:?}"
+    );
     let (status, _) = h
         .call(
             Method::DELETE,
@@ -2713,13 +2916,10 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(deletes.len(), 3, "two allowed and the viewer's denied one");
     assert_eq!(
-        deletes
-            .iter()
-            .filter(|r| r.entry.outcome == Outcome::Denied)
-            .count(),
-        1
+        tally(&deletes),
+        (2, 1, 2),
+        "two allowed, the viewer's denied one, and two for sessions that are not there: {deletes:?}"
     );
     assert!(
         deletes
@@ -2897,7 +3097,7 @@ async fn ontology_is_versioned_over_the_api_and_the_web_page() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(writes.len(), 3);
+    assert_eq!(tally(&writes), (3, 0, 2), "{writes:?}");
 
     // The web page renders the tree and the version list.
     let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
@@ -3071,7 +3271,7 @@ async fn ontology_page_forms_edit_property_meanings_and_measures() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(writes.len(), 5);
+    assert_eq!(tally(&writes), (5, 0, 3), "{writes:?}");
 }
 
 /// Local mode answers only loopback names on its port: a page on a name
@@ -5447,7 +5647,7 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(audits.len(), 2, "API and web builds");
+    assert_eq!(tally(&audits), (2, 0, 1), "API and web builds: {audits:?}");
     let searches = h
         .audit(AuditFilter {
             workspace_id: Some(ws),
@@ -5641,9 +5841,9 @@ async fn renames_move_the_graph_and_revalidation_shows_what_it_drops_first() {
         })
         .await;
     assert_eq!(
-        writes.len(),
-        3,
-        "the import and the two renames: {writes:?}"
+        tally(&writes),
+        (3, 0, 3),
+        "the import and the two renames, and the renames that failed: {writes:?}"
     );
 
     // The ontology loses a class: the preview says what a revalidation
@@ -5725,9 +5925,9 @@ async fn renames_move_the_graph_and_revalidation_shows_what_it_drops_first() {
         })
         .await;
     assert_eq!(
-        revalidations.len(),
-        1,
-        "refused posts drop and audit nothing"
+        tally(&revalidations),
+        (1, 0, 2),
+        "one drop; each refused post is an error row and drops nothing: {revalidations:?}"
     );
 }
 
@@ -6486,16 +6686,9 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         })
         .await;
     assert_eq!(
-        imports.len(),
-        4,
-        "two allowed, the refused control.db, and the failed query; the bad URL never reaches the audit"
-    );
-    assert_eq!(
-        imports
-            .iter()
-            .filter(|r| r.entry.outcome == Outcome::Error)
-            .count(),
-        2
+        tally(&imports),
+        (2, 0, 4),
+        "two allowed, the refused control.db, and the failed ones, a bad URL among them: {imports:?}"
     );
 }
 
@@ -9073,13 +9266,10 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(saves.len(), 4, "one allowed, three refused: {saves:?}");
     assert_eq!(
-        saves
-            .iter()
-            .filter(|r| r.entry.outcome == Outcome::Error)
-            .count(),
-        3
+        tally(&saves),
+        (1, 0, 4),
+        "one allowed, four refused or failed: {saves:?}"
     );
 
     // Anyone who may read lists, shows, and runs.
@@ -9223,13 +9413,10 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(deletes.len(), 2, "one denied, one allowed: {deletes:?}");
     assert_eq!(
-        deletes
-            .iter()
-            .filter(|r| r.entry.outcome == Outcome::Denied)
-            .count(),
-        1
+        tally(&deletes),
+        (1, 1, 1),
+        "one denied, one allowed, one for an id that is not there: {deletes:?}"
     );
     let detail = db
         .run(|db| audit::list(db, 100))
@@ -9427,7 +9614,7 @@ async fn sessions_are_renamed_by_their_creator_and_searched_within_what_one_may_
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(renames.len(), 3, "{renames:?}");
+    assert_eq!(tally(&renames), (3, 0, 1), "{renames:?}");
     let searches = h
         .audit(AuditFilter {
             workspace_id: Some(ws.clone()),
@@ -9702,7 +9889,7 @@ async fn a_person_edits_graph_nodes_and_edges_over_the_api_and_the_page() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(edits.len(), 7, "{edits:?}");
+    assert_eq!(tally(&edits), (7, 0, 5), "{edits:?}");
     assert!(
         edits
             .iter()
@@ -10059,8 +10246,12 @@ async fn an_admin_self_grant_needs_a_reason_and_is_marked_break_glass() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(glass.len(), 1, "{glass:?}");
-    assert_eq!(glass[0].entry.user_id.as_ref(), Some(&root_id));
+    assert_eq!(tally(&glass), (1, 0, 2), "{glass:?}");
+    let granted = glass
+        .iter()
+        .find(|row| row.entry.outcome == Outcome::Allowed)
+        .unwrap_or_else(|| fail("a break-glass grant"));
+    assert_eq!(granted.entry.user_id.as_ref(), Some(&root_id));
     let details = h
         .app
         .read(&ws, |db| audit::list(db, 50))
@@ -10072,7 +10263,7 @@ async fn an_admin_self_grant_needs_a_reason_and_is_marked_break_glass() {
             .find(|d| &d.id == id)
             .and_then(|d| d.detail.clone())
     };
-    let detail = by_id(&glass[0].entry.id).unwrap_or_default();
+    let detail = by_id(&granted.entry.id).unwrap_or_default();
     assert_eq!(detail["role"], "owner", "{detail}");
     assert_eq!(detail["reason"], "incident 42");
     assert_eq!(detail["acting_as"], "admin");
@@ -12288,4 +12479,205 @@ async fn a_turn_that_labels_a_table_audits_the_run_under_its_id() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(started_by, Some(owner.to_string()));
+}
+
+/// A request that fails after its caller was authorized leaves exactly one
+/// audit row, an error. Each request below names something that is not there
+/// or asks for something that cannot be done, on a route that writes its row
+/// through `Access::audited`; a route that wrote nothing, or `allowed` before
+/// its work ran, fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_fails_after_authorization_leaves_one_error_row() {
+    let h = harness(ServeMode::Local).await;
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "w" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let base = format!("/api/v1/workspaces/{ws}");
+    let missing = uuid::Uuid::now_v7().to_string();
+    let sql = |statement: &str| Some(serde_json::json!({ "sql": statement }));
+    let requests: Vec<(Method, String, Option<serde_json::Value>)> = vec![
+        (Method::GET, format!("/documents/{missing}"), None),
+        (Method::GET, format!("/documents/{missing}/chunks"), None),
+        (Method::GET, format!("/documents/{missing}/image"), None),
+        (Method::DELETE, format!("/documents/{missing}"), None),
+        (
+            Method::PATCH,
+            format!("/documents/{missing}"),
+            Some(serde_json::json!({ "title": "t" })),
+        ),
+        (
+            Method::PATCH,
+            format!("/documents/{missing}"),
+            Some(serde_json::json!({})),
+        ),
+        (Method::GET, format!("/sessions/{missing}"), None),
+        (Method::GET, format!("/sessions/{missing}/export"), None),
+        (Method::DELETE, format!("/sessions/{missing}"), None),
+        (
+            Method::PATCH,
+            format!("/sessions/{missing}"),
+            Some(serde_json::json!({ "title": "t" })),
+        ),
+        (Method::GET, format!("/saved/{missing}"), None),
+        (Method::GET, format!("/saved/{missing}/runs"), None),
+        (
+            Method::POST,
+            format!("/saved/{missing}/run"),
+            Some(serde_json::json!({})),
+        ),
+        (Method::DELETE, format!("/saved/{missing}"), None),
+        (
+            Method::POST,
+            String::from("/saved"),
+            Some(serde_json::json!({ "name": "q", "session_id": missing })),
+        ),
+        (Method::GET, format!("/jobs/{missing}"), None),
+        (
+            Method::POST,
+            format!("/jobs/{missing}/cancel"),
+            Some(serde_json::json!({})),
+        ),
+        (
+            Method::POST,
+            String::from("/tables/describe"),
+            Some(serde_json::json!({ "name": "nope" })),
+        ),
+        (
+            Method::POST,
+            String::from("/tables/retype"),
+            Some(serde_json::json!({ "name": "nope", "column": "c", "type": "BIGINT" })),
+        ),
+        (
+            Method::POST,
+            String::from("/sql"),
+            sql("SELECT * FROM nope"),
+        ),
+        (Method::GET, String::from("/ontology"), None),
+        (
+            Method::POST,
+            String::from("/ontology/versions/99/restore"),
+            Some(serde_json::json!({})),
+        ),
+        (
+            Method::POST,
+            String::from("/graph/nodes"),
+            Some(serde_json::json!({ "label": "a", "class": "nope" })),
+        ),
+        (Method::DELETE, format!("/graph/nodes/{missing}"), None),
+        (Method::DELETE, format!("/graph/edges/{missing}"), None),
+        (
+            Method::PUT,
+            format!("/graph/merges/{missing}"),
+            Some(serde_json::json!({ "action": "accept" })),
+        ),
+        (
+            Method::POST,
+            String::from("/search"),
+            Some(serde_json::json!({ "query": "   " })),
+        ),
+        (
+            Method::POST,
+            String::from("/query"),
+            Some(serde_json::json!({ "prompt": "  " })),
+        ),
+        (
+            Method::POST,
+            String::from("/import"),
+            Some(serde_json::json!({ "url": "nope", "table": "t" })),
+        ),
+    ];
+    for (method, path, body) in requests {
+        let rows_of = || {
+            h.audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                ..AuditFilter::default()
+            })
+        };
+        let before = rows_of().await.len();
+        let (status, response) = h
+            .call(method.clone(), &format!("{base}{path}"), None, body)
+            .await;
+        assert!(
+            status.is_client_error() || status.is_server_error(),
+            "{method} {path} should fail: {status} {response}"
+        );
+        let after = rows_of().await;
+        assert_eq!(
+            after.len(),
+            before + 1,
+            "{method} {path} ({status}) writes one row: {after:?}"
+        );
+        assert_eq!(
+            after.first().map(|r| r.entry.outcome),
+            Some(Outcome::Error),
+            "{method} {path} ({status}) is an error row: {after:?}"
+        );
+    }
+}
+
+/// A client that drops the SSE stream mid-turn still leaves the turn's
+/// audit row: the turn's job writes it from its own result, not the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_stream_still_audits_its_turn() {
+    // A provider that accepts the connection and never answers, so the turn
+    // is in flight when the client goes away.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .port();
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            open.push(socket);
+        }
+        drop(open);
+    });
+    let config = Config::parse(&format!(
+        "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:{port}\"\n"
+    ))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Local, config).await;
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "w" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws}/query/stream"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "prompt": "hi" }).to_string(),
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let Ok(response) = h.router.clone().oneshot(request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    let rows = h
+        .audit_eventually(
+            AuditFilter {
+                workspace_id: Some(ws),
+                action: Some(String::from("query")),
+                ..AuditFilter::default()
+            },
+            |rows| !rows.is_empty(),
+        )
+        .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    held.abort();
 }

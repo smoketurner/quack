@@ -17,6 +17,15 @@ file the change just went into, then the access row. When the access row cannot 
 JSON (`the access audit row could not be written`), and the request answers 500 with code
 `unaudited`, never as if the change had failed.
 
+A request that fails after its caller was authorized (an id that is not there, a statement that
+errors, a provider that is unreachable) writes an `error` row, or a `denied` one when a check
+refused it, whatever the action below says; the outcomes in the table are the ones a request
+that gets that far can end in. The row is written after the work, from its result
+(`Access::audited` in the server, `Caller::audited` in MCP), so no handler records `allowed`
+before the work runs. A streamed agent turn is recorded by its job, so a client that goes away
+mid-turn still leaves its `query` row. A request the framework refuses before the handler runs
+(a body that is not JSON, a missing credential) is not authorized yet and writes no workspace row.
+
 `quack audit` and `GET /api/v1/admin/audit` read the access log; `--format ocsf` and
 `?format=ocsf` render each row as an OCSF 1.9.0 event (`quack_core::ocsf`):
 Authentication [3002] for sign-ins and sign-outs, API Activity [6003] for everything else,

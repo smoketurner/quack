@@ -15,11 +15,11 @@ use quack_core::ingestion;
 use quack_core::ingestion::upload::{UploadJob, Uploads};
 use quack_core::jobs::JobId;
 use quack_core::llm::Embeddings;
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use quack_core::text::NonBlankText;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::run;
 use crate::state::{App, with_db};
@@ -110,11 +110,12 @@ pub(crate) async fn list(
     Query(q): Query<ListFilter>,
 ) -> ApiResult<Json<DocumentPage>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let listing = q.listing()?;
-    access
-        .audit_read(&app, AuditAction::List, "documents")
+    let page = access
+        .audited(&app, Audit::read(AuditAction::List, "documents"), async {
+            let listing = q.listing()?;
+            app.read(&id, move |db| db.documents(&listing)).await
+        })
         .await?;
-    let page = app.read(&id, move |db| db.documents(&listing)).await?;
     Ok(Json(page))
 }
 
@@ -131,20 +132,16 @@ pub(crate) async fn show(
     Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
 ) -> ApiResult<Json<DocumentInfo>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit(
+    let audit = Audit::of(AuditAction::Open).resource(ResourceKind::Document, doc.as_str());
+    let document = access
+        .audited(
             &app,
-            AuditAction::Open,
-            Some(ResourceKind::Document.id(&doc)),
-            Outcome::Allowed,
-            None,
+            audit,
+            app.read(&id, move |db| {
+                db.document(&doc)?
+                    .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))
+            }),
         )
-        .await?;
-    let document = app
-        .read(&id, move |db| {
-            db.document(&doc)?
-                .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))
-        })
         .await?;
     Ok(Json(document))
 }
@@ -195,24 +192,23 @@ pub(crate) async fn read_chunks(
     page: ChunkPage,
 ) -> ApiResult<Chunks> {
     let limit = page.limit.clamp(1, ChunkPage::MAX_LIMIT);
-    access
-        .audit(
-            app,
-            AuditAction::Open,
-            Some(ResourceKind::Document.id(doc)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "chunks_from": page.from, "limit": limit })),
-        )
-        .await?;
+    let audit = Audit::of(AuditAction::Open)
+        .resource(ResourceKind::Document, doc.as_str())
+        .detail(serde_json::json!({ "chunks_from": page.from, "limit": limit }));
     let doc = doc.clone();
-    app.read(&access.membership.workspace.id, move |db| {
-        let document = db
-            .document(&doc)?
-            .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))?;
-        let chunks = db.document_chunks(&doc, page.from, limit)?;
-        Ok(Chunks { document, chunks })
-    })
-    .await
+    access
+        .audited(
+            app,
+            audit,
+            app.read(&access.membership.workspace.id, move |db| {
+                let document = db
+                    .document(&doc)?
+                    .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))?;
+                let chunks = db.document_chunks(&doc, page.from, limit)?;
+                Ok(Chunks { document, chunks })
+            }),
+        )
+        .await
 }
 
 /// A page of one document's chunks.
@@ -259,30 +255,23 @@ pub(crate) async fn read_image(
     access: &Access,
     doc: &DocumentId,
 ) -> ApiResult<axum::response::Response> {
+    let audit = Audit::of(AuditAction::Open)
+        .resource(ResourceKind::Document, doc.as_str())
+        .detail(serde_json::json!({ "image": true }));
     let wanted = doc.clone();
-    let found = app
-        .read(&access.membership.workspace.id, move |db| {
-            let document = db
-                .document(&wanted)?
-                .ok_or_else(|| ResourceKind::Document.missing(wanted.as_str()))?;
-            db.stored_image(&document)
-                .ok_or_else(|| ResourceKind::Document.missing(format!("an image named {wanted}")))
+    let image = access
+        .audited(app, audit, async {
+            app.read(&access.membership.workspace.id, move |db| {
+                let document = db
+                    .document(&wanted)?
+                    .ok_or_else(|| ResourceKind::Document.missing(wanted.as_str()))?;
+                db.stored_image(&document).ok_or_else(|| {
+                    ResourceKind::Document.missing(format!("an image named {wanted}"))
+                })
+            })
+            .await
         })
-        .await;
-    access
-        .audit(
-            app,
-            AuditAction::Open,
-            Some(ResourceKind::Document.id(doc)),
-            if found.is_ok() {
-                Outcome::Allowed
-            } else {
-                Outcome::Error
-            },
-            Some(serde_json::json!({ "image": true })),
-        )
         .await?;
-    let image = found?;
     let bytes = image.read().await?;
     Ok(([(header::CONTENT_TYPE, image.format().mime_type())], bytes).into_response())
 }
@@ -442,40 +431,39 @@ async fn import_bundle(
     } else {
         enqueue(app, access, DocumentSource::Upload, files, None).await?
     };
-    let db = app.workspace(&access.membership.workspace.id).await?.writer;
     let for_candidates = bundle.clone();
     let author = access.identity.username.clone();
-    let report = with_db(db, move |db| {
-        for_candidates.restore_into(
-            db,
-            Revision::reviewed(Some(&author), Some("restored from a bundle")),
-        )
-    })
-    .await?;
     // `restore_into` writes the workspace ontology (when it had none) and a
-    // candidate run; mirror `api/ontology.rs` and audit each write so the
-    // workspace audit trail records who installed the bundle.
-    if let Some(version) = report.restored {
-        access
-            .audit(
-                app,
-                AuditAction::Ontology,
-                Some(ResourceKind::OntologyVersion.id(&version.to_string())),
-                Outcome::Allowed,
-                Some(serde_json::json!({ "restored": true, "source": "bundle" })),
-            )
+    // candidate run; each write is audited so the workspace audit trail
+    // records who installed the bundle.
+    let audit = Audit::of(AuditAction::Ontology)
+        .detail(serde_json::json!({ "restored": false, "source": "bundle" }));
+    let report = access
+        .audited_with(app, audit, async |audit| {
+            let db = app.workspace(&access.membership.workspace.id).await?.writer;
+            let report = with_db(db, move |db| {
+                for_candidates.restore_into(
+                    db,
+                    Revision::reviewed(Some(&author), Some("restored from a bundle")),
+                )
+            })
             .await?;
-    }
+            match report.restored {
+                Some(version) => {
+                    audit.set_resource(ResourceKind::OntologyVersion, version.to_string());
+                    audit.set_detail(serde_json::json!({ "restored": true, "source": "bundle" }));
+                }
+                // No snapshot to restore: only a failure leaves an ontology row.
+                None => audit.already_recorded(),
+            }
+            Ok(report)
+        })
+        .await?;
     if let Some(run) = report.run.as_ref() {
-        access
-            .audit(
-                app,
-                AuditAction::Propose,
-                Some(ResourceKind::InductionRun.id(run)),
-                Outcome::Allowed,
-                Some(serde_json::json!({ "candidates": report.candidates, "source": "bundle" })),
-            )
-            .await?;
+        let audit = Audit::of(AuditAction::Propose)
+            .resource(ResourceKind::InductionRun, run.as_str())
+            .detail(serde_json::json!({ "candidates": report.candidates, "source": "bundle" }));
+        access.audited(app, audit, async { Ok(()) }).await?;
     }
     let context = bundle.index().map(|index| {
         okf::parse_front_matter(&index.content)
@@ -583,20 +571,22 @@ pub(crate) async fn enqueue(
     files: Vec<IncomingFile>,
     replaces: Option<DocumentId>,
 ) -> ApiResult<Vec<Enqueued>> {
-    if files.is_empty() {
-        return Err(ApiError::bad_request("no file or text in the request"));
-    }
-    if replaces.is_some() && files.len() != 1 {
-        return Err(ApiError::bad_request("replace takes exactly one file"));
-    }
     let id = access.membership.workspace.id.clone();
-    // Fail now, not in the background, when no model can be built.
+    // Each file audits itself, so this audits only a request that fails
+    // before any file is registered.
     let embedder = access
-        .model(
-            app,
-            AuditAction::Ingest,
-            Embeddings::from_config(&app.engine.config).await,
-        )
+        .audited_with(app, Audit::of(AuditAction::Ingest), async |audit| {
+            if files.is_empty() {
+                return Err(ApiError::bad_request("no file or text in the request"));
+            }
+            if replaces.is_some() && files.len() != 1 {
+                return Err(ApiError::bad_request("replace takes exactly one file"));
+            }
+            // Fail now, not in the background, when no model can be built.
+            let embedder = Embeddings::from_config(&app.engine.config).await?;
+            audit.already_recorded();
+            Ok(embedder)
+        })
         .await?;
     let db = app.workspace(&id).await?.writer;
     let mut queued = Vec::with_capacity(files.len());
@@ -626,95 +616,93 @@ struct Lane<'a> {
 }
 
 impl Lane<'_> {
-    /// Register `file`, audit it, and hand it to the upload lane, or
-    /// report the document that already holds its bytes.
+    /// Register `file`, hand it to the upload lane, and audit it, or report
+    /// the document that already holds its bytes. The row comes last, so a
+    /// failed write of it cannot leave a registered document with no job.
     async fn enqueue_one(self, file: IncomingFile) -> ApiResult<Enqueued> {
-        let IncomingFile {
-            name: filename,
-            data,
-        } = file;
         let (app, access) = (self.app, self.access);
-        let filename = std::path::Path::new(&filename)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned)
-            .ok_or_else(|| ApiError::bad_request("bad file name"))?;
-        // A name without a known extension gets the one its bytes show,
-        // here, so the job that processes it reads the same name.
-        let filename = ingestion::recorded_name(&filename, ingestion::FileData::Bytes(&data))?;
-        let size = data.len();
-        let name = filename.clone();
-        let user = access.identity.user_id.clone();
-        let title = match self.source {
-            DocumentSource::Paste => std::path::Path::new(&filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_owned),
-            DocumentSource::Upload
-            | DocumentSource::Path
-            | DocumentSource::Stdin
-            | DocumentSource::Import
-            | DocumentSource::Classify => None,
-        };
-        let (source, old) = (self.source, self.replaces.cloned());
-        let config = app.engine.config.clone();
-        let registration = with_db(Arc::clone(self.db), move |db| {
-            ingestion::register_document(
-                db,
-                &config,
-                &ingestion::NewFile::new(&name, &data)
-                    .source(source)
-                    .title(title.as_deref())
-                    .ingested_by(Some(user.as_str()))
-                    .replaces(old.as_ref()),
-            )
-            .map(|r| (r, data))
-        })
-        .await?;
-        let (document_id, data) = match registration {
-            (ingestion::Registration::New(id), data) => (id, data),
-            (ingestion::Registration::Duplicate(existing), _) => {
-                access
-                    .audit(
-                        app,
-                        AuditAction::Ingest,
-                        Some(ResourceKind::Document.id(&existing.id)),
-                        Outcome::Allowed,
-                        Some(serde_json::json!({
+        let audit = Audit::of(AuditAction::Ingest).detail(serde_json::json!({
+            "filename": file.name,
+            "size_bytes": file.data.len(),
+            "replaces": self.replaces,
+        }));
+        access
+            .audited_with(app, audit, async |audit| {
+                let IncomingFile {
+                    name: filename,
+                    data,
+                } = file;
+                let filename = std::path::Path::new(&filename)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| ApiError::bad_request("bad file name"))?;
+                // A name without a known extension gets the one its bytes
+                // show, here, so the job that processes it reads the same
+                // name.
+                let filename =
+                    ingestion::recorded_name(&filename, ingestion::FileData::Bytes(&data))?;
+                let size = data.len();
+                let name = filename.clone();
+                let user = access.identity.user_id.clone();
+                let title = match self.source {
+                    DocumentSource::Paste => std::path::Path::new(&filename)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_owned),
+                    DocumentSource::Upload
+                    | DocumentSource::Path
+                    | DocumentSource::Stdin
+                    | DocumentSource::Import
+                    | DocumentSource::Classify => None,
+                };
+                let (source, old) = (self.source, self.replaces.cloned());
+                let config = app.engine.config.clone();
+                let registration = with_db(Arc::clone(self.db), move |db| {
+                    ingestion::register_document(
+                        db,
+                        &config,
+                        &ingestion::NewFile::new(&name, &data)
+                            .source(source)
+                            .title(title.as_deref())
+                            .ingested_by(Some(user.as_str()))
+                            .replaces(old.as_ref()),
+                    )
+                    .map(|r| (r, data))
+                })
+                .await?;
+                let (document_id, data) = match registration {
+                    (ingestion::Registration::New(id), data) => (id, data),
+                    (ingestion::Registration::Duplicate(existing), _) => {
+                        audit.set_resource(ResourceKind::Document, existing.id.as_str());
+                        audit.set_detail(serde_json::json!({
                             "filename": filename,
                             "size_bytes": size,
                             "duplicate": true,
-                        })),
-                    )
-                    .await?;
-                return Ok(Enqueued::Duplicate {
-                    id: existing.id,
-                    filename,
-                    existing_filename: existing.filename,
-                });
-            }
-        };
-        access
-            .audit(
-                app,
-                AuditAction::Ingest,
-                Some(ResourceKind::Document.id(&document_id)),
-                Outcome::Allowed,
-                Some(serde_json::json!({
+                        }));
+                        return Ok(Enqueued::Duplicate {
+                            id: existing.id,
+                            filename,
+                            existing_filename: existing.filename,
+                        });
+                    }
+                };
+                audit.set_resource(ResourceKind::Document, document_id.as_str());
+                audit.set_detail(serde_json::json!({
                     "filename": filename,
                     "size_bytes": size,
                     "replaces": self.replaces,
-                })),
-            )
-            .await?;
-        let job = self
-            .queue(app, access, document_id.clone(), filename.clone(), &data)
-            .await?;
-        Ok(Enqueued::Queued {
-            id: document_id,
-            filename,
-            job,
-        })
+                }));
+                let job = self
+                    .queue(app, access, document_id.clone(), filename.clone(), &data)
+                    .await?;
+                Ok(Enqueued::Queued {
+                    id: document_id,
+                    filename,
+                    job,
+                })
+            })
+            .await
     }
 
     /// Spool `data` for the document just registered and queue its job in
@@ -815,9 +803,17 @@ pub(crate) async fn update(
     } else {
         Some(set_fields(&app, &access, &doc, body.fields).await?)
     };
-    document.map(Json).ok_or_else(|| {
-        ApiError::bad_request("nothing to change: give pinned, title, author, authored_at, or tags")
-    })
+    if let Some(document) = document {
+        return Ok(Json(document));
+    }
+    let audit = Audit::of(AuditAction::Context).resource(ResourceKind::Document, doc.as_str());
+    access
+        .audited(&app, audit, async {
+            Err(ApiError::bad_request(
+                "nothing to change: give pinned, title, author, authored_at, or tags",
+            ))
+        })
+        .await
 }
 
 /// Set a document's own fields, audited with what changed.
@@ -827,24 +823,20 @@ pub(crate) async fn set_fields(
     doc: &DocumentId,
     fields: DocumentFields,
 ) -> ApiResult<DocumentInfo> {
-    let db = app.workspace(&access.membership.workspace.id).await?.writer;
-    let (doc_id, detail) = (doc.clone(), serde_json::to_value(FieldsDetail(&fields))?);
-    let document = with_db(db, move |db| {
-        db.set_document_fields(&doc_id, &fields)?;
-        db.document(&doc_id)?
-            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
-    })
-    .await?;
+    let audit = Audit::of(AuditAction::Context).resource(ResourceKind::Document, doc.as_str());
     access
-        .audit(
-            app,
-            AuditAction::Context,
-            Some(ResourceKind::Document.id(doc)),
-            Outcome::Allowed,
-            Some(detail),
-        )
-        .await?;
-    Ok(document)
+        .audited_with(app, audit, async |audit| {
+            audit.set_detail(serde_json::to_value(FieldsDetail(&fields))?);
+            let db = app.workspace(&access.membership.workspace.id).await?.writer;
+            let doc_id = doc.clone();
+            with_db(db, move |db| {
+                db.set_document_fields(&doc_id, &fields)?;
+                db.document(&doc_id)?
+                    .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
+            })
+            .await
+        })
+        .await
 }
 
 /// The audit detail of a fields edit: which fields were set, never the
@@ -873,24 +865,21 @@ pub(crate) async fn set_pinned(
     doc: &DocumentId,
     pinning: Pinning,
 ) -> ApiResult<DocumentInfo> {
-    let db = app.workspace(&access.membership.workspace.id).await?.writer;
-    let doc_id = doc.clone();
-    let document = with_db(db, move |db| {
-        db.set_document_pinning(&doc_id, pinning)?;
-        db.document(&doc_id)?
-            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
-    })
-    .await?;
+    let audit = Audit::of(AuditAction::Context)
+        .resource(ResourceKind::Document, doc.as_str())
+        .detail(serde_json::json!({ "pinned": bool::from(pinning) }));
     access
-        .audit(
-            app,
-            AuditAction::Context,
-            Some(ResourceKind::Document.id(doc)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "pinned": bool::from(pinning) })),
-        )
-        .await?;
-    Ok(document)
+        .audited(app, audit, async {
+            let db = app.workspace(&access.membership.workspace.id).await?.writer;
+            let doc_id = doc.clone();
+            with_db(db, move |db| {
+                db.set_document_pinning(&doc_id, pinning)?;
+                db.document(&doc_id)?
+                    .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
+            })
+            .await
+        })
+        .await
 }
 
 /// Delete the document, and its table when it was loaded as one.
@@ -917,24 +906,21 @@ pub(crate) async fn delete_document(
     access: &Access,
     doc: &DocumentId,
 ) -> ApiResult<String> {
-    let db = app.workspace(&access.membership.workspace.id).await?.writer;
-    let doc_id = doc.clone();
-    let filename = with_db(db, move |db| {
-        let document = db
-            .document(&doc_id)?
-            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))?;
-        db.delete_document(&doc_id)?;
-        Ok(document.filename)
-    })
-    .await?;
+    let audit = Audit::of(AuditAction::Delete).resource(ResourceKind::Document, doc.as_str());
     access
-        .audit(
-            app,
-            AuditAction::Delete,
-            Some(ResourceKind::Document.id(doc)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "filename": filename })),
-        )
-        .await?;
-    Ok(filename)
+        .audited_with(app, audit, async |audit| {
+            let db = app.workspace(&access.membership.workspace.id).await?.writer;
+            let doc_id = doc.clone();
+            let filename = with_db(db, move |db| {
+                let document = db
+                    .document(&doc_id)?
+                    .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))?;
+                db.delete_document(&doc_id)?;
+                Ok(document.filename)
+            })
+            .await?;
+            audit.set_detail(serde_json::json!({ "filename": filename }));
+            Ok(filename)
+        })
+        .await
 }

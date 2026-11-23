@@ -6,11 +6,11 @@ use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use quack_core::ids::WorkspaceId;
 use quack_core::storage::context::{self, ContextVersion};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::ApiResult;
 use crate::state::{App, with_db};
 
@@ -39,10 +39,13 @@ pub(crate) async fn show(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "context")
+    let current = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "context"),
+            app.read(&id, context::current),
+        )
         .await?;
-    let current = app.read(&id, context::current).await?;
     let wants_markdown = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -97,18 +100,15 @@ impl Access {
         app: &App,
         content: String,
     ) -> ApiResult<ContextVersion> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let editor = self.identity.username.clone();
-        let stored = with_db(db, move |db| context::set(db, &content, Some(&editor))).await?;
-        self.audit(
-            app,
-            AuditAction::Context,
-            Some(ResourceKind::Context.id(&stored.version.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "version": stored.version, "chars": stored.content.chars().count() })),
-        )
-        .await?;
-        Ok(stored)
+        self.audited_with(app, Audit::of(AuditAction::Context), async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let editor = self.identity.username.clone();
+            let stored = with_db(db, move |db| context::set(db, &content, Some(&editor))).await?;
+            audit.set_resource(ResourceKind::Context, stored.version.to_string());
+            audit.set_detail(serde_json::json!({ "version": stored.version, "chars": stored.content.chars().count() }));
+            Ok(stored)
+        })
+        .await
     }
 }
 
@@ -145,10 +145,13 @@ pub(crate) async fn versions(
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<ContextHistory>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "context_versions")
-        .await?;
     let limit = q.limit;
-    let history = app.read(&id, move |db| context::history(db, limit)).await?;
+    let history = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "context_versions"),
+            app.read(&id, move |db| context::history(db, limit)),
+        )
+        .await?;
     Ok(Json(ContextHistory { versions: history }))
 }

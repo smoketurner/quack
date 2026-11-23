@@ -5,12 +5,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, GroupRoleRow, MemberRow, Outcome, ResourceKind, Role, Standing,
+    AuditAction, GroupRoleRow, MemberRow, ResourceKind, Role, Standing,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::state::App;
 
@@ -34,10 +34,11 @@ pub(crate) async fn list(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<MemberList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
-    access
-        .audit_read(&app, AuditAction::List, "members")
+    let members = access
+        .audited(&app, Audit::read(AuditAction::List, "members"), async {
+            Ok(app.control.list_members(&id).await?)
+        })
         .await?;
-    let members = app.control.list_members(&id).await?;
     Ok(Json(MemberList { members }))
 }
 
@@ -103,73 +104,95 @@ pub(crate) struct NewMember {
 
 impl Access {
     /// Give a user a role in this workspace, from the API or the web
-    /// console; an existing member's role changes.
+    /// console; an existing member's role changes. `Gone` when the
+    /// membership was removed while its role was being changed.
     pub(crate) async fn add_member(&self, app: &App, member: &AddMember) -> ApiResult<NewMember> {
-        let user = app
-            .control
-            .find_user_by_username(&member.username)
-            .await?
-            .ok_or_else(|| ApiError::not_found("no such user"))?;
-        // An admin with no membership giving themself a role: membership by
-        // admin right, marked as such and never without a reason.
-        let self_grant = self.membership.standing == Standing::Admin
-            && self.identity.is_admin()
-            && user.id == self.identity.user_id;
-        let reason = member
-            .reason
-            .as_deref()
-            .map(str::trim)
-            .filter(|r| !r.is_empty());
-        let (action, detail) = if self_grant {
-            let Some(reason) = reason else {
-                return Err(ApiError::bad_request(
-                    "granting yourself access to a workspace you are not a member of needs a reason",
-                ));
+        // The member row commits with the change, so the work writes its own
+        // access row; this records only a request that fails before that.
+        self.audited_with(app, Audit::of(AuditAction::Member), async |audit| {
+            let user = app
+                .control
+                .find_user_by_username(&member.username)
+                .await?
+                .ok_or_else(|| ApiError::not_found("no such user"))?;
+            // An admin with no membership giving themself a role: membership
+            // by admin right, marked as such and never without a reason.
+            let self_grant = self.membership.standing == Standing::Admin
+                && self.identity.is_admin()
+                && user.id == self.identity.user_id;
+            let reason = member
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty());
+            let (action, detail) = if self_grant {
+                audit.set_action(AuditAction::BreakGlass);
+                let Some(reason) = reason else {
+                    return Err(ApiError::bad_request(
+                        "granting yourself access to a workspace you are not a member of needs a reason",
+                    ));
+                };
+                (
+                    AuditAction::BreakGlass,
+                    serde_json::json!({ "role": member.role, "reason": reason, "acting_as": "admin" }),
+                )
+            } else {
+                (
+                    AuditAction::Member,
+                    serde_json::json!({ "role": member.role }),
+                )
             };
-            (
-                AuditAction::BreakGlass,
-                serde_json::json!({ "role": member.role, "reason": reason, "acting_as": "admin" }),
-            )
-        } else {
-            (
-                AuditAction::Member,
-                serde_json::json!({ "role": member.role }),
-            )
-        };
-        let entry = self.entry(action, Outcome::Allowed);
-        app.control
-            .set_member(
-                &self.membership.workspace.id,
-                &user.id,
-                member.role,
-                entry.clone(),
-            )
-            .await?;
-        self.record_detail(app, &entry, Some(detail)).await?;
-        Ok(NewMember {
-            user_id: user.id,
-            username: user.username,
-            role: member.role,
+            let entry = self.committed_entry(action);
+            let added = app
+                .control
+                .set_member(
+                    &self.membership.workspace.id,
+                    &user.id,
+                    member.role,
+                    entry.clone(),
+                )
+                .await?;
+            audit.already_recorded();
+            let detail = if added {
+                detail
+            } else {
+                serde_json::json!({ "role": member.role, "reason": "no longer a member" })
+            };
+            self.record_detail(app, &entry, Some(detail)).await?;
+            if !added {
+                return Err(ApiError::gone(
+                    "the membership was removed while the role was being changed; nothing was \
+                     changed",
+                ));
+            }
+            Ok(NewMember {
+                user_id: user.id,
+                username: user.username,
+                role: member.role,
+            })
         })
+        .await
     }
 
     /// Take a user out of this workspace; one who was not a member is an
-    /// error, after the failed attempt is audited as such. `Allowed` is
-    /// for work that succeeded (`Outcome::of`): a no-op removal that
-    /// answers `404` is `Error`.
+    /// error, after the attempt is audited.
     pub(crate) async fn remove_member(&self, app: &App, user_id: &UserId) -> ApiResult<()> {
-        let entry = self.entry(AuditAction::Member, Outcome::Allowed);
-        let removed = app
-            .control
-            .remove_member(&self.membership.workspace.id, user_id, entry.clone())
-            .await?;
-        let detail = (!removed).then(|| serde_json::json!({ "reason": "not a member" }));
-        self.record_detail(app, &entry, detail).await?;
-        if removed {
-            Ok(())
-        } else {
-            Err(ApiError::not_found("not a member"))
-        }
+        self.audited_with(app, Audit::of(AuditAction::Member), async |audit| {
+            let entry = self.committed_entry(AuditAction::Member);
+            let removed = app
+                .control
+                .remove_member(&self.membership.workspace.id, user_id, entry.clone())
+                .await?;
+            audit.already_recorded();
+            let detail = (!removed).then(|| serde_json::json!({ "reason": "not a member" }));
+            self.record_detail(app, &entry, detail).await?;
+            if removed {
+                Ok(())
+            } else {
+                Err(ApiError::not_found("not a member"))
+            }
+        })
+        .await
     }
 }
 
@@ -193,8 +216,11 @@ pub(crate) async fn groups(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<GroupList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
-    access.audit_read(&app, AuditAction::List, "groups").await?;
-    let groups = app.control.list_group_roles(&id).await?;
+    let groups = access
+        .audited(&app, Audit::read(AuditAction::List, "groups"), async {
+            Ok(app.control.list_group_roles(&id).await?)
+        })
+        .await?;
     Ok(Json(GroupList { groups }))
 }
 
@@ -251,44 +277,53 @@ impl Access {
         app: &App,
         body: &GroupRole,
     ) -> ApiResult<GroupRoleRow> {
-        let entry = self.entry(AuditAction::Member, Outcome::Allowed);
-        let row = app
-            .control
-            .set_group_role(
-                &self.membership.workspace.id,
-                &body.group,
-                body.role,
-                entry.clone(),
+        self.audited_with(app, Audit::of(AuditAction::Member), async |audit| {
+            let entry = self.committed_entry(AuditAction::Member);
+            let row = app
+                .control
+                .set_group_role(
+                    &self.membership.workspace.id,
+                    &body.group,
+                    body.role,
+                    entry.clone(),
+                )
+                .await?;
+            audit.already_recorded();
+            self.record_detail(
+                app,
+                &entry,
+                Some(serde_json::json!({ "group": row.group_name, "role": row.role })),
             )
             .await?;
-        self.record_detail(
-            app,
-            &entry,
-            Some(serde_json::json!({ "group": row.group_name, "role": row.role })),
-        )
-        .await?;
-        Ok(row)
+            Ok(row)
+        })
+        .await
     }
 
     /// Take a group's role away; one that had none is an error, after the
     /// attempt is audited as such.
     pub(crate) async fn remove_group_role(&self, app: &App, group: &str) -> ApiResult<()> {
-        let entry = self
-            .entry(AuditAction::Member, Outcome::Allowed)
-            .on(ResourceKind::Group.id(group));
-        let removed = app
-            .control
-            .remove_group_role(&self.membership.workspace.id, group, entry.clone())
-            .await?;
-        let detail = serde_json::json!({
-            "group": group,
-            "reason": (!removed).then_some("no role"),
-        });
-        self.record_detail(app, &entry, Some(detail)).await?;
-        if removed {
-            Ok(())
-        } else {
-            Err(ApiError::not_found("that group has no role here"))
-        }
+        let audit = Audit::of(AuditAction::Member).resource(ResourceKind::Group, group);
+        self.audited_with(app, audit, async |audit| {
+            let entry = self
+                .committed_entry(AuditAction::Member)
+                .on(ResourceKind::Group.id(group));
+            let removed = app
+                .control
+                .remove_group_role(&self.membership.workspace.id, group, entry.clone())
+                .await?;
+            audit.already_recorded();
+            let detail = serde_json::json!({
+                "group": group,
+                "reason": (!removed).then_some("no role"),
+            });
+            self.record_detail(app, &entry, Some(detail)).await?;
+            if removed {
+                Ok(())
+            } else {
+                Err(ApiError::not_found("that group has no role here"))
+            }
+        })
+        .await
     }
 }

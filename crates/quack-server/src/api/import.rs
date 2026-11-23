@@ -9,13 +9,13 @@ use quack_core::error::Error as CoreError;
 use quack_core::ids::WorkspaceId;
 use quack_core::llm::Embeddings;
 use quack_core::progress::RunControl;
-use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::storage::control::AuditAction;
 use quack_core::storage::profile::ColumnTypes;
 use quack_core::text::NonBlankText;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::run::{self, RunKind};
 use crate::state::{App, ServeMode};
@@ -158,78 +158,66 @@ pub(crate) async fn run_import(
     saving: Option<(String, KeepSecret)>,
 ) -> ApiResult<Imported> {
     let source = request.url.redacted();
-    let kind = request
-        .url
-        .kind()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    // `--local` is the owner at a keyboard; anyone else is held to
-    // `[import]`: no files from the server's disk, no private hosts, and no
-    // credentials of the server's own.
-    let policy = if app.mode == ServeMode::Local {
-        ImportPolicy::owner()
-    } else {
-        ImportPolicy::server(&app.engine.config)
-    };
-    if let Err(refused) = request.check(kind, policy) {
-        if matches!(refused, CoreError::ServerCredentials) {
-            let detail = serde_json::json!({ "source": source, "table": request.table });
-            access
-                .audit(
-                    app,
-                    AuditAction::Import,
-                    None,
-                    Outcome::Denied,
-                    Some(detail),
-                )
+    let audit = Audit::of(AuditAction::Import)
+        .detail(serde_json::json!({ "source": source, "table": request.table }));
+    let (summary, db, embeddings) = access
+        .audited_with(app, audit, async |audit| {
+            let kind = request
+                .url
+                .kind()
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            // `--local` is the owner at a keyboard; anyone else is held to
+            // `[import]`: no files from the server's disk, no private hosts,
+            // and no credentials of the server's own.
+            let policy = if app.mode == ServeMode::Local {
+                ImportPolicy::owner()
+            } else {
+                ImportPolicy::server(&app.engine.config)
+            };
+            if let Err(refused) = request.check(kind, policy) {
+                return Err(if matches!(refused, CoreError::ServerCredentials) {
+                    ApiError::from(refused)
+                } else {
+                    ApiError::bad_request(refused.to_string())
+                });
+            }
+            if let Some((name, keep)) = &saving {
+                request
+                    .check_saveable(*keep)
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                let name = name.clone();
+                app.read(&access.membership.workspace.id, move |db| {
+                    SavedImport::check_name(db, &name)
+                })
                 .await?;
-            return Err(ApiError::from(refused));
-        }
-        return Err(ApiError::bad_request(refused.to_string()));
-    }
-    if let Some((name, keep)) = &saving {
-        request
-            .check_saveable(*keep)
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        let name = name.clone();
-        app.read(&access.membership.workspace.id, move |db| {
-            SavedImport::check_name(db, &name)
+            }
+            let db = app.workspace(&access.membership.workspace.id).await?.writer;
+            let embeddings = Embeddings::from_config(&app.engine.config).await?;
+            let outcome = import::Importing {
+                config: &app.engine.config,
+                db: &db,
+                workspace_id: access.membership.workspace.id.as_str(),
+                request,
+                policy,
+                embedder: embeddings.as_ref(),
+                control: RunControl::unobserved(),
+            }
+            .run()
+            .await;
+            audit.set_detail(serde_json::json!({
+                "source": source,
+                "table": request.table,
+                "query": request.query,
+                "source_table": request.source_table,
+                "headers": request.headers.iter().map(SourceHeader::name).collect::<Vec<_>>(),
+                "json_pointer": request.json_pointer.as_ref().map(ToString::to_string),
+                "rows": outcome.as_ref().ok().map(|s| s.rows),
+            }));
+            let summary =
+                outcome.map_err(|e| ApiError::from(e).unprocessable_as(ErrorCode::ImportFailed))?;
+            Ok((summary, db, embeddings))
         })
         .await?;
-    }
-    let db = app.workspace(&access.membership.workspace.id).await?.writer;
-    let embeddings = access
-        .model(
-            app,
-            AuditAction::Import,
-            Embeddings::from_config(&app.engine.config).await,
-        )
-        .await?;
-    let outcome = import::Importing {
-        config: &app.engine.config,
-        db: &db,
-        workspace_id: access.membership.workspace.id.as_str(),
-        request,
-        policy,
-        embedder: embeddings.as_ref(),
-        control: RunControl::unobserved(),
-    }
-    .run()
-    .await;
-    let detail = serde_json::json!({
-        "source": source,
-        "table": request.table,
-        "query": request.query,
-        "source_table": request.source_table,
-        "headers": request.headers.iter().map(SourceHeader::name).collect::<Vec<_>>(),
-        "json_pointer": request.json_pointer.as_ref().map(ToString::to_string),
-        "rows": outcome.as_ref().ok().map(|s| s.rows),
-    });
-    let audit_outcome = Outcome::of(&outcome);
-    access
-        .audit(app, AuditAction::Import, None, audit_outcome, Some(detail))
-        .await?;
-    let summary =
-        outcome.map_err(|e| ApiError::from(e).unprocessable_as(ErrorCode::ImportFailed))?;
     let saved = match saving {
         Some((name, keep)) => Some(
             access
@@ -266,20 +254,20 @@ impl Access {
     /// Refresh `saved` as an audited background job: replaced when the
     /// source changed, with the graph follow-up after a load.
     pub(crate) async fn refresh_import(&self, app: &App, saved: SavedImport) -> ApiResult<JobId> {
-        let embeddings = self
-            .model(
-                app,
-                AuditAction::Import,
-                Embeddings::from_config(&app.engine.config).await,
-            )
+        let (embeddings, run) = self
+            .audited_with(app, Audit::of(AuditAction::Import), async |audit| {
+                let embeddings = Embeddings::from_config(&app.engine.config).await?;
+                let run = run::start(
+                    app,
+                    self,
+                    RunKind::IMPORT_REFRESH,
+                    serde_json::json!({ "import": saved.id, "name": saved.name, "source": saved.source }),
+                )
+                .await?;
+                audit.already_recorded();
+                Ok((embeddings, run))
+            })
             .await?;
-        let run = run::start(
-            app,
-            self,
-            RunKind::IMPORT_REFRESH,
-            serde_json::json!({ "import": saved.id, "name": saved.name, "source": saved.source }),
-        )
-        .await?;
         let (app_for_job, access_for_job) = (Arc::clone(app), self.clone());
         let job = run.submit(move |ctx| async move {
             let cancel = ctx.cancel_token();
@@ -333,18 +321,15 @@ impl Access {
 
     /// Remove `saved` and its sealed secret, audited; its table stays.
     pub(crate) async fn remove_import(&self, app: &App, saved: &SavedImport) -> ApiResult<()> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let vault = Vault::new(app.engine.config.data_dir(), KeySource::Keychain);
-        self.secrets(app, &vault).remove(&db, saved).await?;
-        self.audit(
-            app,
-            AuditAction::Delete,
-            Some(ResourceKind::SavedImport.id(&saved.id)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "name": saved.name })),
-        )
-        .await?;
-        Ok(())
+        let audit = Audit::of(AuditAction::Delete)
+            .resource(ResourceKind::SavedImport, saved.id.as_str())
+            .detail(serde_json::json!({ "name": saved.name }));
+        self.audited(app, audit, async {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let vault = Vault::new(app.engine.config.data_dir(), KeySource::Keychain);
+            Ok(self.secrets(app, &vault).remove(&db, saved).await?)
+        })
+        .await
     }
 
     /// Save `request`, which ran as `summary`, under `name`, by the caller.
@@ -401,10 +386,13 @@ pub(crate) async fn list_saved(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<SavedImports>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "saved imports")
+    let imports = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "saved imports"),
+            app.read(&id, SavedImport::list),
+        )
         .await?;
-    let imports = app.read(&id, SavedImport::list).await?;
     Ok(Json(SavedImports { imports }))
 }
 

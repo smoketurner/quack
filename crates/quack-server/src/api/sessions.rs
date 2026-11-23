@@ -7,14 +7,14 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use quack_core::analysis::events::Decision;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageHit, MessageRow, SessionRow, Sharing, Transcript,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::permissions;
 use crate::state::{App, with_db};
@@ -77,20 +77,17 @@ impl Access {
         limit: u32,
     ) -> ApiResult<Vec<MessageHit>> {
         let (viewer, text) = (self.session_viewer(), query.to_owned());
-        let hits = app
-            .read(&self.membership.workspace.id, move |db| {
-                sessions::search_messages(db, &text, &viewer, limit)
-            })
-            .await?;
-        self.audit(
-            app,
-            AuditAction::Search,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({ "sessions": query, "hits": hits.len() })),
-        )
-        .await?;
-        Ok(hits)
+        let audit = Audit::of(AuditAction::Search).detail(serde_json::json!({ "sessions": query }));
+        self.audited_with(app, audit, async |audit| {
+            let hits = app
+                .read(&self.membership.workspace.id, move |db| {
+                    sessions::search_messages(db, &text, &viewer, limit)
+                })
+                .await?;
+            audit.set_detail(serde_json::json!({ "sessions": query, "hits": hits.len() }));
+            Ok(hits)
+        })
+        .await
     }
 }
 
@@ -115,15 +112,16 @@ pub(crate) async fn list(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<SessionList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "sessions")
-        .await?;
     let viewer = access.session_viewer();
     let limit = q.limit;
-    let rows = app
-        .read(&id, move |db| {
-            sessions::list_sessions_for(db, limit, &viewer)
-        })
+    let rows = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "sessions"),
+            app.read(&id, move |db| {
+                sessions::list_sessions_for(db, limit, &viewer)
+            }),
+        )
         .await?;
     Ok(Json(SessionList { sessions: rows }))
 }
@@ -167,21 +165,18 @@ pub(crate) async fn show(
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
 ) -> ApiResult<Json<SessionDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let session = access.visible_session(&app, &sid).await?;
-    let session_id = session.id.clone();
-    let messages = app
-        .read(&id, move |db| sessions::messages(db, &session_id))
+    let audit = Audit::of(AuditAction::SessionRead).resource(ResourceKind::Session, sid.as_str());
+    let detail = access
+        .audited(&app, audit, async {
+            let session = access.visible_session(&app, &sid).await?;
+            let session_id = session.id.clone();
+            let messages = app
+                .read(&id, move |db| sessions::messages(db, &session_id))
+                .await?;
+            Ok(SessionDetail { session, messages })
+        })
         .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::SessionRead,
-            Some(ResourceKind::Session.id(&sid)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-    Ok(Json(SessionDetail { session, messages }))
+    Ok(Json(detail))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -251,25 +246,16 @@ pub(crate) async fn remove(
 /// What a session's creator, or an owner or admin, may do to it; the API
 /// and the web console share these.
 impl Access {
-    /// The session, when the caller may change it; otherwise the refusal
-    /// is audited as `action` and answered 403 with `refusal`.
+    /// The session, when the caller may change it; otherwise 403 with
+    /// `refusal`, which the audit of the work records as a denial.
     async fn own_session(
         &self,
         app: &App,
         sid: &SessionId,
-        action: AuditAction,
         refusal: &'static str,
     ) -> ApiResult<SessionRow> {
         let session = self.visible_session(app, sid).await?;
         if !self.owns(session.created_by.as_ref()) {
-            self.audit(
-                app,
-                action,
-                Some(ResourceKind::Session.id(sid)),
-                Outcome::Denied,
-                None,
-            )
-            .await?;
             return Err(ApiError::forbidden(refusal));
         }
         Ok(session)
@@ -282,31 +268,27 @@ impl Access {
         sid: &SessionId,
         mode: ChatMode,
     ) -> ApiResult<SessionRow> {
-        let session = self
-            .own_session(
-                app,
-                sid,
-                AuditAction::Mode,
-                "only the session's creator or an owner may change its mode",
-            )
-            .await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let session_id = session.id;
-        let updated = with_db(db, move |db| {
-            sessions::set_session_mode(db, &session_id, mode)?;
-            sessions::get_session(db, &session_id)?
-                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
+        let audit = Audit::of(AuditAction::Mode)
+            .resource(ResourceKind::Session, sid.as_str())
+            .detail(serde_json::json!({ "mode": mode.as_str() }));
+        self.audited(app, audit, async {
+            let session = self
+                .own_session(
+                    app,
+                    sid,
+                    "only the session's creator or an owner may change its mode",
+                )
+                .await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let session_id = session.id;
+            with_db(db, move |db| {
+                sessions::set_session_mode(db, &session_id, mode)?;
+                sessions::get_session(db, &session_id)?
+                    .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
+            })
+            .await
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Mode,
-            Some(ResourceKind::Session.id(sid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "mode": mode.as_str() })),
-        )
-        .await?;
-        Ok(updated)
+        .await
     }
 
     /// Share a session with every member, or take it back.
@@ -316,31 +298,27 @@ impl Access {
         sid: &SessionId,
         sharing: Sharing,
     ) -> ApiResult<SessionRow> {
-        let session = self
-            .own_session(
-                app,
-                sid,
-                AuditAction::Share,
-                "only the session's creator or an owner may share it",
-            )
-            .await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let session_id = session.id;
-        let updated = with_db(db, move |db| {
-            sessions::set_session_sharing(db, &session_id, sharing)?;
-            sessions::get_session(db, &session_id)?
-                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
+        let audit = Audit::of(AuditAction::Share)
+            .resource(ResourceKind::Session, sid.as_str())
+            .detail(serde_json::json!({ "shared": bool::from(sharing) }));
+        self.audited(app, audit, async {
+            let session = self
+                .own_session(
+                    app,
+                    sid,
+                    "only the session's creator or an owner may share it",
+                )
+                .await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let session_id = session.id;
+            with_db(db, move |db| {
+                sessions::set_session_sharing(db, &session_id, sharing)?;
+                sessions::get_session(db, &session_id)?
+                    .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
+            })
+            .await
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Share,
-            Some(ResourceKind::Session.id(sid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "shared": bool::from(sharing) })),
-        )
-        .await?;
-        Ok(updated)
+        .await
     }
 
     /// Rename a session; a blank title gives back the derived one. The
@@ -351,57 +329,51 @@ impl Access {
         sid: &SessionId,
         title: &str,
     ) -> ApiResult<SessionRow> {
-        let session = self
-            .own_session(
-                app,
-                sid,
-                AuditAction::Rename,
-                "only the session's creator or an owner may rename it",
-            )
+        let audit = Audit::of(AuditAction::Rename).resource(ResourceKind::Session, sid.as_str());
+        self.audited_with(app, audit, async |audit| {
+            let session = self
+                .own_session(
+                    app,
+                    sid,
+                    "only the session's creator or an owner may rename it",
+                )
+                .await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let (session_id, title) = (session.id, title.to_owned());
+            let updated = with_db(db, move |db| {
+                sessions::set_session_title(db, &session_id, &title)
+            })
             .await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let (session_id, title) = (session.id, title.to_owned());
-        let updated = with_db(db, move |db| {
-            sessions::set_session_title(db, &session_id, &title)
+            audit.set_detail(
+                serde_json::json!({ "title": updated.title, "title_by": updated.title_by }),
+            );
+            Ok(updated)
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Rename,
-            Some(ResourceKind::Session.id(sid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "title": updated.title, "title_by": updated.title_by })),
-        )
-        .await?;
-        Ok(updated)
+        .await
     }
 
     /// Delete a session, audited as `delete`.
     pub(crate) async fn delete_session(&self, app: &App, sid: &SessionId) -> ApiResult<()> {
-        let session = self
-            .own_session(
-                app,
-                sid,
-                AuditAction::Delete,
-                "only the session's creator or an owner may delete it",
-            )
-            .await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let session_id = session.id;
-        with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
-        // The file's rows went with the session; the live listing follows.
-        app.engine.jobs.forget_session(sid);
-        self.audit(
-            app,
-            AuditAction::Delete,
-            Some(ResourceKind::Session.id(sid)),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-        Ok(())
+        let audit = Audit::of(AuditAction::Delete).resource(ResourceKind::Session, sid.as_str());
+        self.audited(app, audit, async {
+            let session = self
+                .own_session(
+                    app,
+                    sid,
+                    "only the session's creator or an owner may delete it",
+                )
+                .await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let session_id = session.id;
+            with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
+            // The file's rows went with the session; the live listing follows.
+            app.engine.jobs.forget_session(sid);
+            Ok(())
+        })
+        .await
     }
 }
+
 #[derive(Deserialize, utoipa::IntoParams)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
@@ -427,19 +399,16 @@ pub(crate) async fn export(
     Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let session = access.visible_session(&app, &sid).await?;
     let format = q.format;
-    let text = app
-        .read(&id, move |db| Transcript::load(db, session)?.render(format))
-        .await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Export,
-            Some(ResourceKind::Session.id(&sid)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "format": q.format })),
-        )
+    let audit = Audit::of(AuditAction::Export)
+        .resource(ResourceKind::Session, sid.as_str())
+        .detail(serde_json::json!({ "format": format }));
+    let text = access
+        .audited(&app, audit, async {
+            let session = access.visible_session(&app, &sid).await?;
+            app.read(&id, move |db| Transcript::load(db, session)?.render(format))
+                .await
+        })
         .await?;
     let content_type = match format {
         ExportFormat::Sql => "application/sql; charset=utf-8",
@@ -472,32 +441,21 @@ pub(crate) async fn decide(
 ) -> ApiResult<axum::http::StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let answer = body.decision;
-    let resource = Some(ResourceKind::Session.id(&sid));
+    let audit = Audit::of(AuditAction::Permission).resource(ResourceKind::Session, sid.as_str());
     match permissions::decide(&app, &access, &sid, &request, answer) {
         Ok(sql) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::Permission,
-                    resource,
-                    answer.outcome(),
-                    Some(serde_json::json!({
-                        "request": request, "sql": sql, "decision": answer.as_str(),
-                    })),
-                )
-                .await?;
+            let detail = serde_json::json!({
+                "request": request, "sql": sql, "decision": answer.as_str(),
+            });
+            access.answered(&app, audit.detail(detail), answer).await?;
             Ok(axum::http::StatusCode::NO_CONTENT)
         }
         Err(refusal) => {
-            access
-                .audit(
-                    &app,
-                    AuditAction::Permission,
-                    resource,
-                    Outcome::Denied,
-                    refusal.detail(&request, answer),
-                )
-                .await?;
+            let audit = match refusal.detail(&request, answer) {
+                Some(detail) => audit.detail(detail),
+                None => audit,
+            };
+            access.denied(&app, audit).await?;
             Err(refusal.into())
         }
     }
