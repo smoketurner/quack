@@ -2348,8 +2348,8 @@ fn trim_graph_text(text: &str, budget: usize) -> String {
     }
     format!(
         "{kept}... {} more lines not shown: narrow the search with a class, a relation, or fewer \
-         hops, and use describe_class to count a class.\n{summary}\n",
-        text.lines().count().saturating_sub(shown)
+          hops, and use describe_class to count a class.\n{summary}\n",
+        text.lines().count().saturating_sub(shown).saturating_sub(1)
     )
 }
 

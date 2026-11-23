@@ -290,9 +290,10 @@ pub fn path(
     let mut seen: BTreeSet<NodeId> = BTreeSet::from([from.id.clone()]);
     let mut frontier: VecDeque<NodeId> = VecDeque::from([from.id.clone()]);
     let mut found = false;
+    let mut exhausted = false;
     let max_visited = usize::try_from(options.max_nodes).unwrap_or(usize::MAX);
     for _ in 0..limit {
-        if frontier.is_empty() || found {
+        if frontier.is_empty() || found || exhausted {
             break;
         }
         let current: Vec<NodeId> = frontier.drain(..).collect();
@@ -306,20 +307,30 @@ pub fn path(
             if seen.contains(&there) {
                 continue;
             }
-            seen.insert(there.clone());
-            parent.insert(there.clone(), (here, edge.id));
             if there == to.id {
+                parent.insert(there, (here, edge.id));
                 found = true;
                 break;
             }
-            if seen.len() >= max_visited {
-                break;
+            // Past the budget the level is still read to its end, for `to`
+            // alone: a path one edge away is not missed for the edge order.
+            if exhausted {
+                continue;
             }
-            frontier.push_back(there);
+            seen.insert(there.clone());
+            parent.insert(there.clone(), (here, edge.id));
+            if seen.len() >= max_visited {
+                exhausted = true;
+            } else {
+                frontier.push_back(there);
+            }
         }
     }
     if !found {
-        return Ok(GraphResult::default());
+        return Ok(GraphResult {
+            truncated: exhausted,
+            ..GraphResult::default()
+        });
     }
     let mut node_ids = vec![to.id.clone()];
     let mut edge_ids = Vec::new();

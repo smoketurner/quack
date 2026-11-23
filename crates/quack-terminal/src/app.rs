@@ -1882,8 +1882,8 @@ impl App {
     /// Cancel a turn: its pending permission requests are refused first so
     /// the tool returns, then the job's token stops the turn, which core
     /// records as cancelled and completes. A queued turn ends without
-    /// running.
-    fn cancel_turn(&mut self, job: Ticket) {
+    /// running. Returns whether the job was still there to cancel.
+    fn cancel_turn(&mut self, job: Ticket) -> bool {
         let mut kept = VecDeque::new();
         for prompt in self.prompts.drain(..) {
             if prompt.is_write_of(job.id) {
@@ -1893,12 +1893,14 @@ impl App {
             }
         }
         self.prompts = kept;
-        if self.jobs.cancel(job.id) {
+        let cancelled = self.jobs.cancel(job.id);
+        if cancelled {
             self.note(
                 MessageKind::System,
                 format!("Cancelling job #{}\u{2026}", job.number),
             );
         }
+        cancelled
     }
 
     /// `/cancel N`: any job by its number.
@@ -2042,8 +2044,11 @@ impl App {
                     return;
                 }
                 None => {
-                    if let Some(job) = self.current_turn() {
-                        self.cancel_turn(job);
+                    // A turn that already ended, still waiting to close, is
+                    // nothing to cancel: the key goes on to quit.
+                    if let Some(job) = self.current_turn()
+                        && self.cancel_turn(job)
+                    {
                         return;
                     }
                 }

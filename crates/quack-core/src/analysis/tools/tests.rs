@@ -314,6 +314,65 @@ fn an_oversized_rendering_is_cut_but_keeps_its_totals() {
     );
 }
 
+#[expect(clippy::unwrap_used, reason = "test asserts the reported count")]
+#[test]
+fn trim_graph_text_reports_only_lines_the_reader_cannot_see() {
+    let body: Vec<String> = (0..60)
+        .map(|i| format!("Node {i:03} (storm_event) {{event_type: Tornado, state: OKLAHOMA}}"))
+        .collect();
+    let summary = "60 of 1529 matching nodes, 0 edges, 60 sources — cut off";
+    let text = format!("{}\n{summary}\n", body.join("\n"));
+
+    let trimmed = trim_graph_text(&text, 400);
+
+    assert!(trimmed.contains(summary), "{trimmed}");
+
+    let reported: usize = trimmed
+        .lines()
+        .find(|l| l.contains("more lines not shown"))
+        .and_then(|l| l.split(" more lines not shown").next())
+        .and_then(|s| s.rsplit("... ").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+
+    let shown_body = body.iter().filter(|line| trimmed.contains(*line)).count();
+    let actually_hidden = body.len() - shown_body;
+
+    assert_eq!(
+        reported, actually_hidden,
+        "reported {reported} should equal actually-hidden {actually_hidden}, not +1"
+    );
+}
+
+#[expect(clippy::unwrap_used, reason = "test asserts the reported count")]
+#[test]
+fn trim_graph_text_reports_zero_when_only_the_summary_overflows() {
+    let body: Vec<String> = (0..5)
+        .map(|i| format!("Node {i:03} (storm_event)"))
+        .collect();
+    let summary = "5 of 1529 matching nodes, 0 edges, 5 sources — cut off";
+    let body_text = format!("{}\n", body.join("\n"));
+    let text = format!("{body_text}{summary}\n");
+
+    let budget = body_text.chars().count();
+    let trimmed = trim_graph_text(&text, budget);
+
+    assert!(trimmed.contains(summary), "{trimmed}");
+    for line in &body {
+        assert!(trimmed.contains(line), "{trimmed}");
+    }
+
+    let reported: usize = trimmed
+        .lines()
+        .find(|l| l.contains("more lines not shown"))
+        .and_then(|l| l.split(" more lines not shown").next())
+        .and_then(|s| s.rsplit("... ").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+
+    assert_eq!(reported, 0, "zero body lines hidden, got {reported}");
+}
+
 #[test]
 fn an_empty_result_says_which_kind_of_empty_it_is() {
     let nothing = EmptyLookup::NoMatch(&[]).text().unwrap_or_default();

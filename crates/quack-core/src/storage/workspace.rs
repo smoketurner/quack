@@ -2729,7 +2729,7 @@ impl WorkspaceDb {
     pub fn fail_stale_uploads(&self) -> Result<usize> {
         let (changed, dropped) = self.write_transaction(|db| {
             let changed = db.conn.execute(
-                "UPDATE _quack_documents SET status = ?, \
+                "UPDATE _quack_documents SET status = ?, tables = NULL, \
                  error_message = 'interrupted by a restart before it was processed; upload it again' \
                  WHERE status IN (?, ?)",
                 duckdb::params![
@@ -2809,6 +2809,24 @@ impl WorkspaceDb {
             duckdb::params![json, id],
         )?;
         Ok(())
+    }
+
+    /// Add `table` to the tables document `id` holds, when it is not there:
+    /// the claim an ingest takes before it creates the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn add_document_table(&self, id: &DocumentId, table: &str) -> Result<()> {
+        let mut tables = self
+            .document(id)?
+            .and_then(|doc| doc.tables)
+            .unwrap_or_default();
+        if tables.iter().any(|held| held == table) {
+            return Ok(());
+        }
+        tables.push(table.to_owned());
+        self.set_document_tables(id, &tables)
     }
 
     /// Record what a parse found the document says about itself. A date
@@ -2977,7 +2995,7 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn mark_document_error(&self, id: &DocumentId, message: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE _quack_documents SET status = ?, error_message = ? WHERE id = ?",
+            "UPDATE _quack_documents SET status = ?, error_message = ?, tables = NULL WHERE id = ?",
             duckdb::params![DocumentStatus::Error, message, id],
         )?;
         // A failed replacement leaves the document it was to replace as it was.
