@@ -1286,6 +1286,37 @@ async fn a_token_exchange_names_the_person_and_quack_and_is_kept_per_person() {
     );
 }
 
+/// A person's exchanged token is forgotten once it has expired and no
+/// request holds it, so the map holds only live tokens.
+#[tokio::test]
+async fn an_expired_delegated_token_is_dropped_when_another_person_exchanges() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |_| {});
+    let ada = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(ada.is_ok(), "{:?}", ada.err());
+    let held = |user: &str| {
+        m.delegated
+            .lock()
+            .is_ok_and(|all| all.contains_key(&UserId::from(user)))
+    };
+    let slot = m
+        .delegated
+        .lock()
+        .ok()
+        .and_then(|all| all.get(&UserId::from("ada")).cloned());
+    if let Some(slot) = slot
+        && let Ok(mut token) = slot.try_lock()
+        && let Some(delegated) = token.as_mut()
+    {
+        delegated.token.expires_at = Timestamp::UNIX_EPOCH;
+    }
+    let bob = Acting::scope(Some(acting("bob", Some("bob-at"))), m.access_token()).await;
+    assert!(bob.is_ok(), "{:?}", bob.err());
+    assert!(!held("ada"), "the expired entry was kept");
+    assert!(held("bob"));
+}
+
 #[tokio::test]
 async fn entras_form_sends_the_assertion_and_no_actor_and_basic_auth_uses_the_header() {
     let idp = MockIdp::start().await;
