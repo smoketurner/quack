@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -389,18 +389,24 @@ impl SourceUrl {
         Path::new(rest.split_once('?').map_or(rest, |(path, _)| path))
     }
 
-    /// Whether a `sqlite:` URL points inside `data_dir`: the control
-    /// database and the workspace files are quack's own, and nothing in
-    /// them belongs in a workspace table, whoever asks.
-    fn is_under(&self, data_dir: &Path) -> bool {
-        let path = self.sqlite_path();
-        if path.starts_with(data_dir) {
-            return true;
+    /// The file a `sqlite:` URL names, resolved to its real path, which is
+    /// both what the guard checks and what SQLite opens: an absolute path is
+    /// never read as a `file:` URI, and a link cannot point elsewhere after
+    /// the check. Refused inside `data_dir`, since the control database and
+    /// the workspace files are quack's own, whoever asks.
+    fn sqlite_file(&self, data_dir: &Path) -> Result<PathBuf> {
+        let named = self.sqlite_path();
+        let file = std::fs::canonicalize(named).map_err(|e| {
+            Error::Ingestion(format!("cannot open the source {}: {e}", named.display()))
+        })?;
+        let own = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        if file.starts_with(own) {
+            return Err(Error::Ingestion(String::from(
+                "quack's own data directory (control.db and the workspace files) \
+                 cannot be imported into a workspace",
+            )));
         }
-        match (std::fs::canonicalize(path), std::fs::canonicalize(data_dir)) {
-            (Ok(p), Ok(d)) => p.starts_with(d),
-            _ => false,
-        }
+        Ok(file)
     }
 }
 
@@ -590,26 +596,18 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                 "files on the server's disk cannot be imported through the server; \
                  run `quack import` on the host, or set [import].allow_local_files",
             ))),
-            SourceKind::Sqlite if request.url.is_under(&config.general.data_dir) => {
-                Err(Error::Ingestion(String::from(
-                    "quack's own data directory (control.db and the workspace files) \
-                     cannot be imported into a workspace",
-                )))
-            }
             SourceKind::Sqlite => {
+                let file = request.url.sqlite_file(&config.general.data_dir)?;
                 let sql = request.source_query()?;
                 let fetch = async {
-                    tokio::time::timeout(
-                        timeout,
-                        fetch_rows(request.url.sqlite_path(), &sql, limit),
-                    )
-                    .await
-                    .map_err(|_| {
-                        Error::Ingestion(format!(
-                            "the source did not answer within {} s",
-                            timeout.as_secs()
-                        ))
-                    })?
+                    tokio::time::timeout(timeout, fetch_rows(&file, &sql, limit))
+                        .await
+                        .map_err(|_| {
+                            Error::Ingestion(format!(
+                                "the source did not answer within {} s",
+                                timeout.as_secs()
+                            ))
+                        })?
                 };
                 let fetched = control.or_cancelled(fetch).await?;
                 Ok(Pulled {

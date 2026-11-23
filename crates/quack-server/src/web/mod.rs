@@ -1264,7 +1264,7 @@ async fn workspaces(
     flash: Flashed,
 ) -> WebResult<Response> {
     let mut times = app.control.workspace_times().await?;
-    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.kind == UserKind::Admin {
+    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin() {
         let mine = if app.mode == ServeMode::Local {
             Vec::new()
         } else {
@@ -1301,7 +1301,7 @@ async fn workspaces(
             .collect()
     };
     html(&WorkspacesPage {
-        can_create: identity.kind == UserKind::Admin && app.engine.held().is_none(),
+        can_create: identity.is_admin() && app.engine.held().is_none(),
         serves_one: app.engine.held().is_some(),
         page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,

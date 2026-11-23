@@ -2047,6 +2047,7 @@ async fn an_api_token_cannot_change_a_password() {
 /// A token the admin gave the admin scope is.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_admins_workspace_token_does_not_administer_the_server() {
+    use quack_core::storage::sessions::{ChatMode, create_session};
     let h = harness(ServeMode::Login).await;
     let root = h.user("root", UserKind::Admin).await;
     let ws = h.workspace("a", &root).await;
@@ -2083,6 +2084,33 @@ async fn an_admins_workspace_token_does_not_administer_the_server() {
     }
     let (status, body) = h.get("/api/v1/admin/users", &admin).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // Nor does it see what only an admin sees: another member's session.
+    let ada = h.user("ada", UserKind::Standard).await;
+    h.app
+        .control
+        .set_member(&ws, &ada, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    h.app
+        .control
+        .set_member(&ws, &root, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let db = h
+        .app
+        .workspace(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
+    let theirs = db
+        .run(move |db| create_session(db, "m", ChatMode::Chat, Some(&ada)).map(|s| s.id))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let session = format!("/api/v1/workspaces/{ws}/sessions/{theirs}");
+    for secret in [&read, &write] {
+        let (status, body) = h.get(&session, secret).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11797,6 +11825,44 @@ async fn a_sql_body_past_the_json_limit_is_refused_before_it_is_read() {
     let path = format!("/api/v1/workspaces/{}/sql", l.ws);
     let (status, _) = l.h.post(&path, &l.owner, request).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A bundle or pasted text past `[ingestion].upload_max_mb` is 413 while
+/// it is read, like a multipart upload, never buffered whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_upload_body_is_held_to_the_upload_limit() {
+    let mut config = Config::default();
+    config.ingestion.upload_max_mb = 1;
+    let h = harness_with(ServeMode::Local, config).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "limits" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let pasted = serde_json::json!({ "text": "x".repeat(2 * 1024 * 1024) }).to_string();
+    let oversized = [
+        ("application/x-tar", vec![0_u8; 2 * 1024 * 1024]),
+        ("application/json", pasted.into_bytes()),
+    ];
+    for (content_type, bytes) in oversized {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/workspaces/{ws}/documents"))
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (status, body, _) = h.send(request).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{content_type}: {body}"
+        );
+        assert_eq!(body["code"], "payload_too_large", "{content_type}: {body}");
+    }
 }
 
 /// A request past the cap is refused while it is read.
