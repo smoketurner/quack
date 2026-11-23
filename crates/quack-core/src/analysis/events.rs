@@ -498,6 +498,7 @@ impl TurnRecorder {
             tool,
             detail: detail.to_owned(),
             started: Instant::now(),
+            open: true,
         }
     }
 
@@ -550,45 +551,62 @@ impl TurnRecorder {
 }
 
 /// A tool call that has started; call `finish` with its one-line result.
+/// One dropped unfinished (an error returned with `?`, a cancelled turn
+/// dropping the call) finishes as an error, so every start has its finish.
 pub struct StepInProgress {
     recorder: TurnRecorder,
     tool: ToolName,
     detail: String,
     started: Instant,
+    open: bool,
+}
+
+impl Drop for StepInProgress {
+    fn drop(&mut self) {
+        if self.open {
+            self.record(
+                String::from("error: the call stopped before it finished"),
+                None,
+                None,
+                None,
+            );
+        }
+    }
 }
 
 impl StepInProgress {
-    pub fn finish(self, summary: impl Into<String>) {
+    pub fn finish(mut self, summary: impl Into<String>) {
         self.record(summary.into(), None, None, None);
     }
 
     /// Finish a step that ran the labelling `run`.
-    pub fn finish_run(self, summary: impl Into<String>, run: RunId) {
+    pub fn finish_run(mut self, summary: impl Into<String>, run: RunId) {
         self.record(summary.into(), None, None, Some(run));
     }
 
     /// Finish a statement that produced `rows` rows.
-    pub fn finish_rows(self, rows: u64) {
+    pub fn finish_rows(mut self, rows: u64) {
         self.record(format!("{rows} rows"), Some(rows), None, None);
     }
 
     /// Finish a statement that produced `rows` rows, keeping the first
     /// `keep` of `result` on the step for the transcript.
-    pub fn finish_with_result(self, rows: u64, mut result: QueryResults, keep: usize) {
+    pub fn finish_with_result(mut self, rows: u64, mut result: QueryResults, keep: usize) {
         result.rows.truncate(keep);
         self.record(format!("{rows} rows"), Some(rows), Some(result), None);
     }
 
     fn record(
-        self,
+        &mut self,
         summary: String,
         rows: Option<u64>,
         result: Option<QueryResults>,
         run: Option<RunId>,
     ) {
+        self.open = false;
         let step = ToolStep {
             tool: self.tool,
-            detail: self.detail,
+            detail: std::mem::take(&mut self.detail),
             summary,
             rows,
             result,
@@ -609,7 +627,7 @@ impl StepInProgress {
 
     /// [`Self::fail`] for a step that began the labelling `run` before it
     /// failed.
-    pub fn fail_run<E: fmt::Display>(self, error: E, run: Option<RunId>) -> E {
+    pub fn fail_run<E: fmt::Display>(mut self, error: E, run: Option<RunId>) -> E {
         self.record(format!("error: {error}"), None, None, run);
         error
     }
@@ -658,6 +676,33 @@ mod tests {
         );
         let failure = TurnFailure::from(&ResourceKind::Session.missing("s1"));
         assert_eq!(failure.to_string(), "session 's1' does not exist");
+    }
+
+    /// A call dropped before it finished (a `?` in the tool, a cancelled
+    /// turn) still finishes, once, as an error; a finished one only once.
+    #[test]
+    fn every_started_step_finishes_once() {
+        let (sink, mut rx) = channel();
+        let recorder = TurnRecorder::new(sink);
+        drop(recorder.start(ToolName::RunSql, "SELECT 1"));
+        recorder.start(ToolName::ListTables, "").finish("2 tables");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let finished: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolFinished(step) => Some(step.summary.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished,
+            ["error: the call stopped before it finished", "2 tables"],
+            "{events:?}"
+        );
+        assert_eq!(recorder.steps().len(), 2);
     }
 
     #[test]
