@@ -3929,6 +3929,104 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
 /// name is refused while its predecessor lives; identical bytes after
 /// the table was dropped load again as a new document and the stale row
 /// fails; rows a restart left queued are failed on open.
+/// A file that fails to load gives its table name back: the next ingest of
+/// the name is not refused for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_load_releases_its_table_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-release").unwrap();
+    let writer = writer_of(&db);
+    let broken = ingestion::NewFile::new("sales.csv", &[0xff_u8, 0xfe, 0x00, 0x80, 0xff, 0x00]);
+    let failed = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-release",
+        &broken,
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await;
+    assert!(failed.is_err(), "the bytes do not load as a table");
+    let good = ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\n");
+    ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-release",
+        &good,
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap();
+    let rows: i64 = db
+        .connection()
+        .query_row("SELECT total FROM sales", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// Two ingests of one table name, started together, do not both load it:
+/// the name is claimed when the file is registered, so the second is refused
+/// while the first is still in flight, and the first's table and `files/`
+/// copy are untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_ingests_of_one_table_name_load_only_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-race").unwrap();
+    let writer = writer_of(&db);
+    let one = b"region,total\nnorth,1\n";
+    let two = b"region,total\nnorth,2\n";
+    let (file_one, file_two) = (
+        ingestion::NewFile::new("sales.csv", one),
+        ingestion::NewFile::new("sales.csv", two),
+    );
+    let (first, second) = tokio::join!(
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-race",
+            &file_one,
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-race",
+            &file_two,
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    );
+    assert!(
+        first.is_ok() != second.is_ok(),
+        "exactly one ingest succeeds: {first:?} {second:?}"
+    );
+    let (refused, bytes, total) = if first.is_ok() {
+        (second.unwrap_err(), one.as_slice(), 1_i64)
+    } else {
+        (first.unwrap_err(), two.as_slice(), 2_i64)
+    };
+    assert!(
+        matches!(refused, Error::TableTaken { .. }),
+        "the loser is refused as {refused}"
+    );
+    let rows: i64 = db
+        .connection()
+        .query_row("SELECT total FROM sales", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, total, "the table holds the winner's rows");
+    let kept = std::fs::read(config.workspace_files_dir("ws-race").join("sales.csv")).unwrap();
+    assert_eq!(kept, bytes, "the winner's file is intact under files/");
+    let listed = db.documents(&DocumentListing::default()).unwrap();
+    assert_eq!(
+        listed
+            .documents
+            .iter()
+            .map(|d| d.status)
+            .collect::<Vec<_>>(),
+        [DocumentStatus::Ready]
+    );
+}
+
 #[tokio::test]
 async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     let dir = tempfile::tempdir().unwrap();
