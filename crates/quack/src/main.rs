@@ -2886,10 +2886,22 @@ async fn finish_file_ingest(
     let result = match outcome {
         IngestOutcome::Ingested(result) => result,
         IngestOutcome::Duplicate(existing) => {
+            if pin {
+                let id = existing.id.clone();
+                ws_db
+                    .run(move |db| db.set_document_pinning(&id, Pinning::Pinned))
+                    .await?;
+            }
             writeln!(
                 out,
-                "Skipped: {effective_filename} is identical to {} (id: {})",
-                existing.filename, existing.id
+                "Skipped: {effective_filename} is identical to {} (id: {}){}",
+                existing.filename,
+                existing.id,
+                if pin {
+                    "; pinned the existing document"
+                } else {
+                    ""
+                }
             )?;
             out.flush()?;
             return Ok(());
