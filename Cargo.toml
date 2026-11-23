@@ -60,6 +60,7 @@ bytes                = { version = "=1.12.2", default-features = false }
 calamine             = { version = "=0.38.0", default-features = false }
 csv                  = { version = "=1.4.0", default-features = false }
 clap                 = { version = "=4.6.8", default-features = false }
+cookie               = { version = "=0.18.3", default-features = false }
 crossterm            = { version = "=0.29.0", default-features = false }
 dirs                 = { version = "=7.0.0", default-features = false }
 duckdb               = { version = "=1.20000.2", default-features = false }
@@ -123,6 +124,7 @@ tower_governor       = { version = "=0.8.0", default-features = false }
 tracing              = { version = "=0.1.44", default-features = false }
 tracing-subscriber   = { version = "=0.3.23", default-features = false }
 unicode-properties   = { version = "=0.1.5", default-features = false }
+url                  = { version = "=2.5.9", default-features = false }
 utoipa               = { version = "=6.0.0", default-features = false } # the REST API's OpenAPI document
 uuid                 = { version = "=1.29.3", default-features = false } # IDs — enable "v7"; use Uuid::now_v7()
 whatlang             = { version = "=0.18.0", default-features = false } # per-document language detection for the keyword index
