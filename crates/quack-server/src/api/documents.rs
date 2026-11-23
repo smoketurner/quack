@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use std::collections::HashMap;
 
 use axum::extract::{FromRequest, Multipart, Path, Query, State};
@@ -376,21 +377,21 @@ pub(crate) async fn upload(
                 "replace takes one file, not a bundle",
             ));
         }
-        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+        let bytes = Bytes::from_request(request, &app)
             .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            .map_err(|e| ApiError::new(e.status(), e.body_text()))?;
         let bundle = Bundle::from_tar(&bytes).map_err(|e| ApiError::bad_request(e.to_string()))?;
         return import_bundle(&app, &access, bundle).await;
     }
     let files = if content_type.starts_with("multipart/form-data") {
         let multipart = Multipart::from_request(request, &app)
             .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            .map_err(|e| ApiError::new(e.status(), e.body_text()))?;
         UploadForm::read(multipart).await?.files
     } else {
-        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+        let bytes = Bytes::from_request(request, &app)
             .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            .map_err(|e| ApiError::new(e.status(), e.body_text()))?;
         let pasted: PastedText =
             serde_json::from_slice(&bytes).map_err(|e| ApiError::bad_request(e.to_string()))?;
         vec![IncomingFile::pasted(&pasted.text, pasted.title.as_deref())?]

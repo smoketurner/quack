@@ -491,8 +491,7 @@ impl Access {
 
     /// Owners and admins see every session; others see their own.
     fn sees_all_sessions(&self) -> bool {
-        self.identity.kind == UserKind::Admin
-            || self.membership.standing == Standing::Member(Role::Owner)
+        self.identity.is_admin() || self.membership.standing == Standing::Member(Role::Owner)
     }
 
     /// Which sessions the caller may read.
@@ -711,16 +710,21 @@ impl Identity {
         Err(ApiError::forbidden(reason))
     }
 
-    /// Server admins only; everything else is 403. An API token acts for
+    /// Whether this caller acts as a server admin. An API token acts for
     /// its admin owner only when it carries the `admin` scope itself: a
     /// read or write token an admin made for one workspace is not a key to
-    /// the whole server.
-    pub(crate) fn require_admin(&self) -> ApiResult<()> {
+    /// the whole server: not server administration, not every member's sessions.
+    pub(crate) fn is_admin(&self) -> bool {
         let scoped = match &self.credential {
             Credential::Token(token) => token.has_scope(Scope::Admin),
             Credential::Local | Credential::Session(_) | Credential::IdentityProvider => true,
         };
-        if self.kind == UserKind::Admin && scoped {
+        self.kind == UserKind::Admin && scoped
+    }
+
+    /// Server admins only; everything else is 403.
+    pub(crate) fn require_admin(&self) -> ApiResult<()> {
+        if self.is_admin() {
             Ok(())
         } else {
             Err(ApiError::forbidden("admin only"))

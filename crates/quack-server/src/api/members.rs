@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, GroupRoleRow, MemberRow, ResourceKind, Role, Standing, UserKind,
+    AuditAction, GroupRoleRow, MemberRow, ResourceKind, Role, Standing,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -118,7 +118,7 @@ impl Access {
             // An admin with no membership giving themself a role: membership
             // by admin right, marked as such and never without a reason.
             let self_grant = self.membership.standing == Standing::Admin
-                && self.identity.kind == UserKind::Admin
+                && self.identity.is_admin()
                 && user.id == self.identity.user_id;
             let reason = member
                 .reason

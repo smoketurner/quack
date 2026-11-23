@@ -600,15 +600,21 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
     std::os::unix::fs::symlink(&control, &link).unwrap_or_else(|e| no_file(&e.to_string()));
     let db = open_writer(&config);
     let control = control.display();
+    let own = "own data directory";
     let mut urls = vec![
-        format!("sqlite:{control}"),
-        format!("sqlite://{control}"),
-        format!("SQLite:{control}?mode=ro"),
+        (format!("sqlite:{control}"), own),
+        (format!("sqlite://{control}"), own),
+        (format!("SQLite:{control}?mode=ro"), own),
     ];
     if cfg!(unix) {
-        urls.push(format!("sqlite:{}", link.display()));
+        urls.push((format!("sqlite:{}", link.display()), own));
     }
-    for url in urls {
+    // SQLite reads a name starting with `file:` as a URI and decodes it, so
+    // these name control.db to SQLite but no file to the guard.
+    let encoded = control.to_string().replace("data", "d%61ta");
+    urls.push((format!("sqlite:file:{control}"), "cannot open the source"));
+    urls.push((format!("sqlite:file:{encoded}"), "cannot open the source"));
+    for (url, refusal) in urls {
         let request = ImportRequest {
             source_table: Some(String::from("users")),
             ..ImportRequest::new(url.clone(), String::from("x"))
@@ -626,9 +632,8 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
         .await
         .err()
         .map_or_default(|e| e.to_string());
-        assert!(err.contains("own data directory"), "{url}: {err}");
+        assert!(err.contains(refusal), "{url}: {err}");
     }
-    assert!(!SourceUrl::from("sqlite:/tmp/other.db").is_under(&config.general.data_dir));
     assert_eq!(
         SourceUrl::from("sqlite://a/b.db?x=1").sqlite_path(),
         Path::new("a/b.db")

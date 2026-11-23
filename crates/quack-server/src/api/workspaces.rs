@@ -71,7 +71,7 @@ pub(crate) async fn list(
                 standing: Standing::of(role),
             })
             .collect()
-    } else if identity.kind == UserKind::Admin {
+    } else if identity.is_admin() {
         let mine = app.control.workspaces_for_user(&identity.user_id).await?;
         let all = app.control.list_workspaces().await?;
         all.into_iter()
