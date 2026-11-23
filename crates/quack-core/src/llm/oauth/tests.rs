@@ -199,7 +199,7 @@ async fn serve(mut stream: tokio::net::TcpStream, base: &str, state: &MockState)
 }
 
 fn form(body: &str, key: &str) -> Option<String> {
-    oauth2::url::form_urlencoded::parse(body.as_bytes())
+    url::form_urlencoded::parse(body.as_bytes())
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.into_owned())
 }

@@ -31,7 +31,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use oauth2::basic::{BasicClient, BasicTokenResponse};
-use oauth2::url::Url;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, DeviceAuthorizationUrl, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
@@ -42,6 +41,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OnceCell, RwLock};
+use url::Url;
 
 use client_key::ClientKeys;
 pub(crate) use credential::Credential;
@@ -278,7 +278,7 @@ impl OAuthHttp {
     ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let mut basic = None;
         let body = {
-            let mut body = oauth2::url::form_urlencoded::Serializer::new(String::new());
+            let mut body = url::form_urlencoded::Serializer::new(String::new());
             for (key, value) in form {
                 body.append_pair(key, value);
             }
@@ -289,8 +289,7 @@ impl OAuthHttp {
                     basic: true,
                 } => {
                     let encode = |part: &str| {
-                        oauth2::url::form_urlencoded::byte_serialize(part.as_bytes())
-                            .collect::<String>()
+                        url::form_urlencoded::byte_serialize(part.as_bytes()).collect::<String>()
                     };
                     basic = Some(base64::engine::general_purpose::STANDARD.encode(format!(
                         "{}:{}",
@@ -1341,7 +1340,7 @@ async fn wait_for_callback(
             respond(&mut stream, http::StatusCode::NOT_FOUND, "Not found.").await;
             continue;
         };
-        let params: HashMap<String, String> = oauth2::url::form_urlencoded::parse(query.as_bytes())
+        let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
         if params.get("state").map(String::as_str) != Some(expected_state) {
