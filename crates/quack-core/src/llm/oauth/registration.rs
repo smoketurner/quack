@@ -24,9 +24,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use oauth2::url::Url;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::client_key::{ALGORITHM, ClientKey, ClientKeyName, ClientKeys, PublicJwks};
 use super::key_slot::KeySource;
