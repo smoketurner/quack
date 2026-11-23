@@ -13,7 +13,7 @@ use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::{Cookie, SameSite};
+use cookie::{Cookie, SameSite};
 use quack_core::config::ServerConfig;
 use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;

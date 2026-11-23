@@ -16,7 +16,6 @@ use oauth2::basic::{
     BasicErrorResponse, BasicErrorResponseType, BasicRevocationErrorResponse,
     BasicTokenIntrospectionResponse, BasicTokenType,
 };
-use oauth2::url::Url;
 use oauth2::{
     AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
     ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
@@ -26,6 +25,7 @@ use oauth2::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+use url::Url;
 
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation};
