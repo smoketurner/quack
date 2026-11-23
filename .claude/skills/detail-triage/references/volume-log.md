@@ -25,6 +25,7 @@ judgement columns come from the batch's record in `.local/`.
 | 2026-10-03 | 5 | 4 | 0 | 0 | 5 | 1 of 4 (#351 amended) | #349, #350, #352 ready as written; #351 amended with the workbook arm; #345 had no PR, fixed on `fix/345-permission-answer-undelivered` | none (first record) | 2 described, 0 requested (no CLI) |
 | 2026-10-05 | 6 | 5 | 0 | 1 | 6 | 3 of 5 (#371 and #372 superseded, #373 rebuilt) | #369, #370 merged as written; #373 rebuilt as #377 after its test stopped compiling on `main`; #371 superseded by #374; #372 superseded by #376; #363 had no PR and was fixed as a class in #375 | none | 1 described, 0 requested |
 | 2026-11-04 | 5 | 1 | 0 | 0 | 0 | 1 of 1 (#623 to be superseded) | pending: #620 already fixed on `main`; #619 and #621 one class fix; #618 class fix; #622 instance | none matched | 2 described, 0 requested (no CLI) |
+| 2026-11-23 | 25 | 6 | 0 | 0 | 0 | 1 of 6 (#671 superseded by #675) | all closed the same day: #647, #655, #665 as already fixed or obsolete; #667 (trimmed), #668, #669, #670, #672 merged as written; class fixes #678 (audit), #679 (tool steps), #680 (candidate review), #681 (table claims); #674, #675, #677 for the rest; #673 the advisory and dependency update that unblocked `cargo deny` | 6 items in the record | 0 requested; 3 described |
 
 These three batches predate this skill and have no `.local/` record, so their
 judgement columns are reconstructed from GitHub, not from a review.
@@ -188,3 +189,46 @@ Pending go-ahead; see `.local/detail-triage-2026-11-04.md`. #623 (Detail's
 fix for #619) duplicates two existing helpers and is not transactional, so it
 is to be superseded by the class fix.
 
+
+## 2026-11-23
+
+77 issues, 2026-09-25 through 2026-11-23; the batch is #642–#666 with fix PRs #667–#672.
+
+| month | n | no attr | median age | p90 age | <30d | >90d |
+|-------|---|---------|-----------|---------|------|------|
+| 2026-11 | 30 | 0 | 67 | 70 | 4 | 0 |
+
+**Reading:** backlog. PR≤3d is 0 of 25; the pass reached September code (MCP, auth,
+ingestion, the server's handlers). Four findings were already fixed or obsolete on `main`
+(#647, #653, #655, #665).
+
+### Classes
+
+- Authorized failure unaudited (#644, #650, #651, #658, #654): about 40 handlers propagate
+  with `?` before an `Allowed` audit, and about 35 `audit_read` calls record before their
+  work. The largest class to date; the first two batches' audit fixes were per handler.
+- Commit, then a fallible step before the completing one (#656, #663, `logout_all`).
+- Partial commits without a transaction (#651 and four siblings).
+- Tool step started with no finished (#645): `StepInProgress` has no `Drop`, ten sites.
+- In-flight table claims (#642): reachable at the default config.
+- Per-user insert-only maps (#664 and two siblings); Detail's #671 covers one map and
+  misses bearer-only callers.
+
+### Decided
+
+All 25 closed on 2026-11-23; see `.local/detail-triage-2026-11-23.md`.
+
+- #673 first: RUSTSEC-2026-0592 (`url`) and RUSTSEC-2026-0594 (`cookie`) failed
+  `cargo deny` on `main` and every PR. Both pinned as direct dependencies, plus a full
+  `cargo update`.
+- Merged as written: #668, #669, #670, #672; #667 after a comment trim.
+- Class fixes with guardrails: #678 (`Access::audited`, `Caller::audited`, outcome-taking
+  recorders in `disallowed-methods`), #679 (`Drop` for `StepInProgress`), #680
+  (`candidates::decide` in the save's transaction), #681 (`TableClaim` at check time).
+- #674 (#643, #653, #661), #675 (replaces #671), #677 (#649, #657, #659, #662).
+- Filed outside the batch: #676 (duplicate ingest drops given fields), #682 (remaining
+  partial-commit sites).
+
+Landing lesson: merging one PR's branch into another to resolve a conflict made both
+UNMERGEABLE once the first squash-merged; resolve against `main` after the first lands.
+macOS runner shortages dropped two PRs from the queue (`checks_timed_out`); re-queued.
