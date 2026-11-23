@@ -326,11 +326,20 @@ async fn register_signed_in(
         }
     };
     write_temporary(out, issuer, &done.earlier)?;
-    if let TemporaryClient::Left { client_id, reason } = &done.temporary {
-        writeln!(
-            out,
-            "quack could not delete the temporary sign-in client {client_id} ({reason}); it keeps a record of it, and the next `quack auth register` tries again."
-        )?;
+    match &done.temporary {
+        TemporaryClient::Left { client_id, reason } => {
+            writeln!(
+                out,
+                "quack could not delete the temporary sign-in client {client_id} ({reason}); it keeps a record of it, and the next `quack auth register` tries again."
+            )?;
+        }
+        TemporaryClient::Unmanaged { client_id } => {
+            writeln!(
+                out,
+                "quack could not delete the temporary sign-in client {client_id} at {issuer}: the issuer returned no registration token for it. Delete it in the issuer's console."
+            )?;
+        }
+        TemporaryClient::Deleted { .. } => {}
     }
     Ok(done.registered)
 }
@@ -377,6 +386,10 @@ fn write_temporary(
             TemporaryClient::Left { client_id, reason } => writeln!(
                 out,
                 "The temporary sign-in client {client_id} at {issuer} is still registered ({reason}); the next `quack auth register` tries again."
+            )?,
+            TemporaryClient::Unmanaged { client_id } => writeln!(
+                out,
+                "The temporary sign-in client {client_id} at {issuer} is still registered; the issuer returned no registration token for it. Delete it in the issuer's console."
             )?,
         }
     }
