@@ -316,7 +316,13 @@ impl Access {
         let version = ontology.saved_version()?;
         let options = app.engine.config.graph;
         let embeddings = Embeddings::from_config(&app.engine.config).await?;
+        // A reset leaves every chunk to read again, so the model that reads
+        // them is checked before anything is cleared.
+        let mut extractor = None;
         if let Some(keep) = reset {
+            if plan.source.includes_documents() {
+                extractor = Some(llm::graph_extractor(&app.engine.config, &ontology).await?);
+            }
             with_db(Arc::clone(&db), move |db| graph_store::clear(db, keep)).await?;
         }
         let table_summaries = if plan.source.includes_tables() {
@@ -344,7 +350,10 @@ impl Access {
             });
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = llm::graph_extractor(&app.engine.config, &ontology).await?;
+        let extractor = match extractor {
+            Some(extractor) => extractor,
+            None => llm::graph_extractor(&app.engine.config, &ontology).await?,
+        };
         let cost = ExtractionCost {
             chunks: chunks.len(),
             model: app.engine.config.chat_model_ref()?.to_string(),

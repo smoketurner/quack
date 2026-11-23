@@ -239,12 +239,18 @@ impl Bundle {
     /// Restore the bundle into a workspace: when the workspace has no
     /// ontology, the snapshot quack's export carries is saved under
     /// `revision`; then the bundle's types and links go to the review
-    /// queue as candidates against the ontology now in force.
+    /// queue as candidates against the ontology now in force. Both commit
+    /// together, or neither does.
     ///
     /// # Errors
     ///
     /// Returns an error when the snapshot does not parse or a write fails.
     pub fn restore_into(&self, db: &WorkspaceDb, revision: Revision<'_>) -> Result<RestoreReport> {
+        db.write_transaction(|db| self.restore_in(db, revision))
+    }
+
+    /// [`Self::restore_into`]'s writes, inside its one transaction.
+    fn restore_in(&self, db: &WorkspaceDb, revision: Revision<'_>) -> Result<RestoreReport> {
         let mut current = ontology_store::current(db)?;
         let mut restored = None;
         if current.is_none()

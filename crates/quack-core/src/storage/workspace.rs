@@ -1,3 +1,4 @@
+use std::cell;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1123,6 +1124,9 @@ pub struct WorkspaceDb {
     files_dir: Option<PathBuf>,
     /// `[retrieval].languages`: what a document may be detected as.
     languages: LanguageSetting,
+    /// Whether a [`Self::write_transaction`] is open on this connection,
+    /// which duckdb-rs cannot report (its `is_autocommit` is always true).
+    in_transaction: cell::Cell<bool>,
 }
 
 impl WorkspaceDb {
@@ -1161,6 +1165,7 @@ impl WorkspaceDb {
             query_timeout: Duration::from_secs(30),
             files_dir: None,
             languages: LanguageSetting::Auto,
+            in_transaction: cell::Cell::new(false),
         };
         db.confine_to(None)?;
         db.create_internal_tables()?;
@@ -1489,6 +1494,7 @@ impl WorkspaceDb {
             query_timeout: config.analysis.query_timeout(),
             files_dir: Some(files_dir),
             languages: config.retrieval.languages.clone(),
+            in_transaction: cell::Cell::new(false),
         };
         db.apply_resource_limits(config)?;
         let workspace_dir = std::fs::canonicalize(config.workspace_dir(workspace_id))?;
@@ -1523,6 +1529,7 @@ impl WorkspaceDb {
             query_timeout: self.query_timeout,
             files_dir: self.files_dir.clone(),
             languages: self.languages.clone(),
+            in_transaction: cell::Cell::new(false),
         })
     }
 
@@ -4188,14 +4195,20 @@ impl WorkspaceDb {
 
     /// Run `f`'s writes as one transaction: committed when `f` returns
     /// `Ok`, rolled back when it errors. A document's chunks, or a batch
-    /// of embeddings, then land in one commit instead of one per row. Not
-    /// re-entrant, like [`Self::read_only`].
+    /// of embeddings, then land in one commit instead of one per row.
+    /// Inside another `write_transaction`, `f` joins it, so steps that each
+    /// take one compose into a single commit; an error must be returned,
+    /// not handled, for the outer transaction to roll it back.
     ///
     /// # Errors
     ///
     /// Returns `f`'s error, or the error from beginning or committing the
     /// transaction itself.
     pub fn write_transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        if self.in_transaction.get() {
+            return f(self);
+        }
+        let _open = TransactionFlag::set(&self.in_transaction);
         let tx = self.conn.unchecked_transaction()?;
         let value = f(self)?;
         tx.commit()?;
@@ -6183,6 +6196,23 @@ struct TimeoutGuard {
 impl TimeoutGuard {
     fn fired(&self) -> bool {
         self.fired.load(Ordering::SeqCst)
+    }
+}
+
+/// Marks a [`WorkspaceDb::write_transaction`] open for as long as it lives,
+/// so a nested call joins it; cleared on every way out, an early `?` included.
+struct TransactionFlag<'a>(&'a cell::Cell<bool>);
+
+impl<'a> TransactionFlag<'a> {
+    fn set(flag: &'a cell::Cell<bool>) -> Self {
+        flag.set(true);
+        Self(flag)
+    }
+}
+
+impl Drop for TransactionFlag<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 
