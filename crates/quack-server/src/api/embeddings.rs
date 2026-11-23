@@ -13,10 +13,10 @@ use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::jobs::JobId;
 use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::storage::control::AuditAction;
 use quack_core::storage::workspace::WorkspaceDb;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::ApiResult;
 use crate::run::{self, BackgroundRun, RunKind};
 use crate::state::App;
@@ -50,9 +50,12 @@ pub(crate) async fn show(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<EmbeddingsReport>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let status = app.read(&id, WorkspaceDb::embedding_status).await?;
-    access
-        .audit_read(&app, AuditAction::EmbeddingsStatus, "embedding status")
+    let status = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::EmbeddingsStatus, "embedding status"),
+            app.read(&id, WorkspaceDb::embedding_status),
+        )
         .await?;
     Ok(Json(EmbeddingsReport {
         stale_chunks: status.stale_chunks(),
@@ -107,27 +110,25 @@ impl RefreshStarted {
 impl Access {
     /// The refresh the API and the web page share.
     pub(crate) async fn refresh_embeddings(&self, app: &App) -> ApiResult<RefreshStarted> {
+        self.audited_with(
+            app,
+            Audit::of(AuditAction::EmbeddingsRefresh),
+            async |audit| self.refresh(app, audit).await,
+        )
+        .await
+    }
+
+    /// The work of [`Access::refresh_embeddings`]; a run audits its own
+    /// start and end.
+    async fn refresh(&self, app: &App, audit: &mut Audit) -> ApiResult<RefreshStarted> {
         // Fail now, not in the background, when no model can be built.
-        let embedder = self
-            .model(
-                app,
-                AuditAction::EmbeddingsRefresh,
-                Embeddings::require(&app.engine.config).await,
-            )
-            .await?;
+        let embedder = Embeddings::require(&app.engine.config).await?;
         let status = app
             .read(&self.membership.workspace.id, WorkspaceDb::embedding_status)
             .await?;
         let plan = Plan::from_status(&status);
         if plan.is_empty() {
-            self.audit(
-                app,
-                AuditAction::EmbeddingsRefresh,
-                None,
-                Outcome::Allowed,
-                Some(serde_json::json!({ "plan": plan, "finished": true })),
-            )
-            .await?;
+            audit.set_detail(serde_json::json!({ "plan": plan, "finished": true }));
             return Ok(RefreshStarted::Current { plan });
         }
         let run = run::start(
@@ -137,6 +138,7 @@ impl Access {
             serde_json::json!({ "plan": plan, "profile": embedder.profile() }),
         )
         .await?;
+        audit.already_recorded();
         let run_id = run.id().clone();
         let job = refresh_in_background(
             run,

@@ -8,11 +8,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::ids::{SavedId, SessionId, WorkspaceId};
 use quack_core::saved::{self, Answer, RunStatus, SavedQuestion, SavedRun};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::state::{App, with_db};
 
@@ -76,9 +76,12 @@ pub(crate) async fn create(
 impl Access {
     /// The workspace's saved questions, audited as a `list`.
     pub(crate) async fn list_saved(&self, app: &App) -> ApiResult<Vec<SavedQuestion>> {
-        self.audit_read(app, AuditAction::List, "saved questions")
-            .await?;
-        app.read(&self.membership.workspace.id, saved::list).await
+        self.audited(
+            app,
+            Audit::read(AuditAction::List, "saved questions"),
+            app.read(&self.membership.workspace.id, saved::list),
+        )
+        .await
     }
 
     /// Save an answer in a session the caller can see under `name`: the
@@ -92,25 +95,22 @@ impl Access {
         session: &SessionId,
         message: Option<i64>,
     ) -> ApiResult<SavedQuestion> {
-        let session = self.visible_session(app, session).await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let answer = message.map_or(Answer::Last, Answer::Seq);
-        let creator = self.identity.user_id.clone();
-        let session_id = session.id.clone();
-        let result = with_db(db, move |db| {
-            saved::save(db, &name, &session_id, answer, Some(&creator))
+        let audit = Audit::of(AuditAction::Save)
+            .detail(serde_json::json!({ "session": session, "message": message }));
+        self.audited_with(app, audit, async |audit| {
+            let session = self.visible_session(app, session).await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let answer = message.map_or(Answer::Last, Answer::Seq);
+            let creator = self.identity.user_id.clone();
+            let session_id = session.id.clone();
+            let question = with_db(db, move |db| {
+                saved::save(db, &name, &session_id, answer, Some(&creator))
+            })
+            .await?;
+            audit.set_resource(ResourceKind::SavedQuestion, question.id.as_str());
+            Ok(question)
         })
-        .await;
-        let resource = result.as_ref().ok().map(|q| q.id.clone());
-        self.audit(
-            app,
-            AuditAction::Save,
-            resource.as_ref().map(|r| ResourceKind::SavedQuestion.id(r)),
-            Outcome::of(&result),
-            Some(serde_json::json!({ "session": session.id, "message": message })),
-        )
-        .await?;
-        result
+        .await
     }
 
     /// The saved question, or 404.
@@ -145,23 +145,20 @@ pub(crate) async fn show(
     Path((id, saved)): Path<(WorkspaceId, SavedId)>,
 ) -> ApiResult<Json<SavedDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let question = access.saved_question(&app, &saved).await?;
-    let wanted = saved.clone();
-    let last_run = app
-        .read(&id, move |db| saved::runs(db, &wanted, 1))
-        .await?
-        .into_iter()
-        .next();
-    access
-        .audit(
-            &app,
-            AuditAction::Open,
-            Some(ResourceKind::SavedQuestion.id(&saved)),
-            Outcome::Allowed,
-            None,
-        )
+    let audit = Audit::of(AuditAction::Open).resource(ResourceKind::SavedQuestion, saved.as_str());
+    let detail = access
+        .audited(&app, audit, async {
+            let question = access.saved_question(&app, &saved).await?;
+            let wanted = saved.clone();
+            let last_run = app
+                .read(&id, move |db| saved::runs(db, &wanted, 1))
+                .await?
+                .into_iter()
+                .next();
+            Ok(SavedDetail { question, last_run })
+        })
         .await?;
-    Ok(Json(SavedDetail { question, last_run }))
+    Ok(Json(detail))
 }
 
 /// Remove a saved question and its runs: its creator, or an owner, may.
@@ -186,71 +183,44 @@ impl Access {
     /// Remove a saved question and its runs: its creator, or an owner, may.
     /// Audited as `delete`.
     pub(crate) async fn remove_saved(&self, app: &App, saved: &SavedId) -> ApiResult<()> {
-        let question = self.saved_question(app, saved).await?;
-        let resource = Some(ResourceKind::SavedQuestion.id(saved));
-        if !self.owns(question.created_by.as_ref()) {
-            self.audit(app, AuditAction::Delete, resource, Outcome::Denied, None)
-                .await?;
-            return Err(ApiError::forbidden(
-                "only the saved question's creator or an owner may remove it",
-            ));
-        }
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        if let Err(e) = with_db(db, move |db| saved::remove(db, &question.id)).await {
-            self.audit(
-                app,
-                AuditAction::Delete,
-                resource,
-                Outcome::Error,
-                Some(serde_json::json!({ "error": e.message })),
-            )
-            .await?;
-            return Err(e);
-        }
-        self.audit(app, AuditAction::Delete, resource, Outcome::Allowed, None)
-            .await?;
-        Ok(())
+        let audit =
+            Audit::of(AuditAction::Delete).resource(ResourceKind::SavedQuestion, saved.as_str());
+        self.audited(app, audit, async {
+            let question = self.saved_question(app, saved).await?;
+            if !self.owns(question.created_by.as_ref()) {
+                return Err(ApiError::forbidden(
+                    "only the saved question's creator or an owner may remove it",
+                ));
+            }
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            with_db(db, move |db| saved::remove(db, &question.id)).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Run the saved SQL now, without the model, audited as `saved_run`
     /// with the run id, its status, and `changed`.
     pub(crate) async fn run_saved(&self, app: &App, saved: &SavedId) -> ApiResult<RunOf> {
-        let question = self.saved_question(app, saved).await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let max_rows = app.engine.config.analysis.max_query_rows;
-        let resource = Some(ResourceKind::SavedQuestion.id(saved));
-        let ran = question.clone();
-        let run = match with_db(db, move |db| saved::run(db, &ran, max_rows)).await {
-            Ok(run) => run,
-            Err(e) => {
-                self.audit(
-                    app,
-                    AuditAction::SavedRun,
-                    resource,
-                    Outcome::Error,
-                    Some(serde_json::json!({ "error": e.message })),
-                )
-                .await?;
-                return Err(e);
+        let audit =
+            Audit::of(AuditAction::SavedRun).resource(ResourceKind::SavedQuestion, saved.as_str());
+        self.audited_with(app, audit, async |audit| {
+            let question = self.saved_question(app, saved).await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let max_rows = app.engine.config.analysis.max_query_rows;
+            let ran = question.clone();
+            let run = with_db(db, move |db| saved::run(db, &ran, max_rows)).await?;
+            if run.status == RunStatus::Failed {
+                audit.ended_in_failure();
             }
-        };
-        let outcome = match run.status {
-            RunStatus::Ok => Outcome::Allowed,
-            RunStatus::Failed => Outcome::Error,
-        };
-        self.audit(
-            app,
-            AuditAction::SavedRun,
-            resource,
-            outcome,
-            Some(serde_json::json!({
+            audit.set_detail(serde_json::json!({
                 "run": run.id,
                 "status": run.status,
                 "changed": run.changed,
-            })),
-        )
-        .await?;
-        Ok(RunOf { question, run })
+            }));
+            Ok(RunOf { question, run })
+        })
+        .await
     }
 }
 
@@ -311,19 +281,15 @@ pub(crate) async fn runs(
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<SavedRuns>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.saved_question(&app, &saved).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::List,
-            Some(ResourceKind::SavedQuestion.id(&saved)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "what": "saved runs" })),
-        )
-        .await?;
+    let audit = Audit::read(AuditAction::List, "saved runs")
+        .resource(ResourceKind::SavedQuestion, saved.as_str());
     let limit = q.limit;
-    let runs = app
-        .read(&id, move |db| saved::runs(db, &saved, limit))
+    let runs = access
+        .audited(&app, audit, async {
+            access.saved_question(&app, &saved).await?;
+            app.read(&id, move |db| saved::runs(db, &saved, limit))
+                .await
+        })
         .await?;
     Ok(Json(SavedRuns { runs }))
 }

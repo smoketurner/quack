@@ -9,9 +9,9 @@ use std::sync::Arc;
 use quack_core::analysis::events::{Decision, PermissionRequest};
 use quack_core::analysis::permissions::{Asker, Held, Refusal};
 use quack_core::ids::{PermissionId, SessionId};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 
-use super::auth::Access;
+use super::auth::{Access, Audit};
 use super::error::ApiError;
 use super::state::App;
 
@@ -31,16 +31,10 @@ pub(crate) fn hold(
         request,
         timeout,
         move |expired| async move {
-            if let Err(e) = access
-                .audit(
-                    &app,
-                    AuditAction::Permission,
-                    Some(ResourceKind::Session.id(&session)),
-                    Outcome::Denied,
-                    Some(expired.detail()),
-                )
-                .await
-            {
+            let audit = Audit::of(AuditAction::Permission)
+                .resource(ResourceKind::Session, session.as_str())
+                .detail(expired.detail());
+            if let Err(e) = access.denied(&app, audit).await {
                 tracing::error!(error = %e.message, "audit write failed");
             }
         },

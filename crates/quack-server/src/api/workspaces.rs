@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
 use crate::api::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
-use crate::auth::{Access, Credential, Identity, Need};
+use crate::auth::{Access, Audit, Credential, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::state::{App, ServeMode};
 
@@ -159,7 +159,7 @@ pub(crate) async fn show(
 ) -> ApiResult<Json<Membership>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
-        .audit(&app, AuditAction::Open, None, Outcome::Allowed, None)
+        .audited(&app, Audit::of(AuditAction::Open), async { Ok(()) })
         .await?;
     Ok(Json(access.membership))
 }
@@ -226,26 +226,26 @@ pub(crate) async fn snapshot(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
-    let described = Described::of(&app.control, &access.membership.workspace).await?;
-    let filename = format!("{}.snapshot.tar", okf::slug(&described.name));
-    let manifest = app.read(&id, move |db| Manifest::of(db, described)).await?;
-    let dir = app.engine.config.workspace_dir(id.as_str());
-    let spool_dir = app.engine.config.data_dir().to_path_buf();
-    let spooled = app
-        .engine
-        .with_workspace_closed(&id, move || {
-            let spool = tempfile::tempfile_in(&spool_dir)?;
-            manifest.write(&dir, spool)
+    // The row of a snapshot that is sent is written when the stream ends.
+    let audit = Audit::of(AuditAction::Snapshot).resource(ResourceKind::Workspace, id.as_str());
+    let (filename, mut spool) = access
+        .audited_with(&app, audit, async |audit| {
+            let described = Described::of(&app.control, &access.membership.workspace).await?;
+            let filename = format!("{}.snapshot.tar", okf::slug(&described.name));
+            let manifest = app.read(&id, move |db| Manifest::of(db, described)).await?;
+            let dir = app.engine.config.workspace_dir(id.as_str());
+            let spool_dir = app.engine.config.data_dir().to_path_buf();
+            let spool = app
+                .engine
+                .with_workspace_closed(&id, move || {
+                    let spool = tempfile::tempfile_in(&spool_dir)?;
+                    manifest.write(&dir, spool)
+                })
+                .await?;
+            audit.already_recorded();
+            Ok((filename, spool))
         })
-        .await
-        .map_err(ApiError::from);
-    let mut spool = match spooled {
-        Ok(spool) => spool,
-        Err(e) => {
-            access.audit_snapshot(&app, &Err(e.message.clone())).await;
-            return Err(e);
-        }
-    };
+        .await?;
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
     let failed = tx.clone();
     tokio::spawn(async move {
@@ -346,29 +346,22 @@ pub(crate) async fn delete(
 
 impl Access {
     /// The `snapshot` audit row, with the error when it failed; a row that
-    /// cannot be written is logged, since the response has gone.
+    /// cannot be written is logged (by the audit), since the response has
+    /// gone.
     async fn audit_snapshot(&self, app: &App, sent: &Result<(), String>) {
         let id = &self.membership.workspace.id;
-        let (outcome, detail) = match sent {
-            Ok(()) => (
-                Outcome::Allowed,
-                serde_json::json!({ "format": "snapshot" }),
-            ),
-            Err(error) => (
-                Outcome::Error,
-                serde_json::json!({ "format": "snapshot", "error": error }),
-            ),
+        let detail = match sent {
+            Ok(()) => serde_json::json!({ "format": "snapshot" }),
+            Err(error) => serde_json::json!({ "format": "snapshot", "error": error }),
         };
-        let recorded = self
-            .audit(
-                app,
-                AuditAction::Snapshot,
-                Some(ResourceKind::Workspace.id(id.as_str())),
-                outcome,
-                Some(detail),
-            )
-            .await;
-        if let Err(e) = recorded {
+        let audit = Audit::of(AuditAction::Snapshot)
+            .resource(ResourceKind::Workspace, id.as_str())
+            .detail(detail);
+        let work = async { sent.clone().map_err(ApiError::internal) };
+        let recorded = self.audited(app, audit, work).await;
+        if let Err(e) = recorded
+            && sent.is_ok()
+        {
             tracing::error!(workspace = %id, error = %e.message, "could not audit a snapshot");
         }
     }
@@ -381,77 +374,88 @@ impl Access {
         app: &App,
         changes: WorkspaceChanges,
     ) -> ApiResult<WorkspaceRow> {
-        if let ProviderAllowList::Only(names) = &changes.allowed_providers
-            && let Some(unknown) = names
-                .iter()
-                .find(|name| !app.engine.config.providers.contains_key(name.as_str()))
-        {
-            return Err(ApiError::bad_request(format!(
-                "'{unknown}' is not a configured provider"
-            )));
-        }
-        let changes = WorkspaceChanges {
-            classification: changes.classification.map(|c| c.trim().to_owned()),
-            ..changes
-        };
-        let ws = app
-            .control
-            .update_workspace(&self.membership.workspace.id, &changes)
-            .await?;
-        self.audit(
-            app,
-            AuditAction::Workspace,
-            Some(ResourceKind::Workspace.id(ws.id.as_str())),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-        Ok(ws)
+        let id = &self.membership.workspace.id;
+        let audit =
+            Audit::of(AuditAction::Workspace).resource(ResourceKind::Workspace, id.as_str());
+        self.audited(app, audit, async {
+            if let ProviderAllowList::Only(names) = &changes.allowed_providers
+                && let Some(unknown) = names
+                    .iter()
+                    .find(|name| !app.engine.config.providers.contains_key(name.as_str()))
+            {
+                return Err(ApiError::bad_request(format!(
+                    "'{unknown}' is not a configured provider"
+                )));
+            }
+            let changes = WorkspaceChanges {
+                classification: changes.classification.map(|c| c.trim().to_owned()),
+                ..changes
+            };
+            Ok(app.control.update_workspace(id, &changes).await?)
+        })
+        .await
     }
 
     /// Rename the workspace for its owner, audited as a settings change; a
     /// name that is already the workspace's own changes nothing.
     pub(crate) async fn rename_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
-        let name: WorkspaceName = name.parse()?;
-        if name.as_str() == self.membership.workspace.name {
-            return Ok(self.membership.workspace.clone());
-        }
-        let entry = self.entry(AuditAction::Workspace, Outcome::Allowed);
-        let ws = app
-            .control
-            .rename_workspace(&self.membership.workspace.id, &name, entry.clone())
+        let audit = Audit::of(AuditAction::Workspace).resource(
+            ResourceKind::Workspace,
+            self.membership.workspace.id.as_str(),
+        );
+        self.audited_with(app, audit, async |audit| {
+            let name: WorkspaceName = name.parse()?;
+            if name.as_str() == self.membership.workspace.name {
+                audit.already_recorded();
+                return Ok(self.membership.workspace.clone());
+            }
+            let entry = self.committed_entry(AuditAction::Workspace);
+            let ws = app
+                .control
+                .rename_workspace(&self.membership.workspace.id, &name, entry.clone())
+                .await?;
+            audit.already_recorded();
+            self.record_detail(
+                app,
+                &entry,
+                Some(serde_json::json!({ "renamed_to": name.as_str() })),
+            )
             .await?;
-        self.record_detail(
-            app,
-            &entry,
-            Some(serde_json::json!({ "renamed_to": name.as_str() })),
-        )
-        .await?;
-        Ok(ws)
+            Ok(ws)
+        })
+        .await
     }
 
     /// Delete the workspace an `Access` names, from the API or the web
     /// console; see [`delete`].
     pub(crate) async fn delete_workspace(&self, app: &App) -> ApiResult<()> {
         let id = &self.membership.workspace.id;
-        app.close_workspace(id).await?;
-        // The server's own hold is closed above; another process's is a
-        // refusal naming it, since a delete under it would lose its writes.
-        if let Some(held) = HeldElsewhere::before_delete(&app.engine.config, id).await {
-            return Err(ApiError::conflict(held.to_string()));
-        }
-        let entry = self.entry(AuditAction::Delete, Outcome::Allowed);
-        app.control.delete_workspace(id, entry).await?;
-        let dir = app.engine.config.workspace_dir(id.as_str());
-        if dir.exists()
-            && let Err(e) = tokio::fs::remove_dir_all(&dir).await
-        {
-            tracing::error!(workspace = %id, error = %e, "the deleted workspace's directory remains");
-            return Err(ApiError::internal(format!(
-                "the workspace is gone from control.db, but its directory could not be removed: {e}"
-            )));
-        }
-        Ok(())
+        let audit = Audit::of(AuditAction::Delete).resource(ResourceKind::Workspace, id.as_str());
+        self.audited_with(app, audit, async |audit| {
+            app.close_workspace(id).await?;
+            // The server's own hold is closed above; another process's is a
+            // refusal naming it, since a delete under it would lose its
+            // writes.
+            if let Some(held) = HeldElsewhere::before_delete(&app.engine.config, id).await {
+                return Err(ApiError::conflict(held.to_string()));
+            }
+            let entry = self.committed_entry(AuditAction::Delete);
+            app.control.delete_workspace(id, entry).await?;
+            // The row is committed with the delete; no detail row can follow
+            // it into a file that no longer exists.
+            audit.already_recorded();
+            let dir = app.engine.config.workspace_dir(id.as_str());
+            if dir.exists()
+                && let Err(e) = tokio::fs::remove_dir_all(&dir).await
+            {
+                tracing::error!(workspace = %id, error = %e, "the deleted workspace's directory remains");
+                return Err(ApiError::internal(format!(
+                    "the workspace is gone from control.db, but its directory could not be removed: {e}"
+                )));
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -514,23 +518,19 @@ pub(crate) async fn audit_detail(
 ) -> ApiResult<Json<AuditDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let limit = q.limit.min(MAX_AUDIT_ROWS);
-    let rows = app.read(&id, move |db| audit::list(db, limit)).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::SessionRead,
-            Some(ResourceKind::Audit.id("detail")),
-            Outcome::Allowed,
-            None,
-        )
+    let audit = Audit::of(AuditAction::SessionRead).resource(ResourceKind::Audit, "detail");
+    let audit = access
+        .audited(&app, audit, async {
+            let rows = app.read(&id, move |db| audit::list(db, limit)).await?;
+            Ok(match q.format {
+                None => AuditEntries::Detail(rows),
+                Some(AuditFormat::Ocsf) => AuditEntries::Ocsf(
+                    app.control
+                        .ocsf_events(&rows, PromptText::from(q.prompt))
+                        .await?,
+                ),
+            })
+        })
         .await?;
-    let audit = match q.format {
-        None => AuditEntries::Detail(rows),
-        Some(AuditFormat::Ocsf) => AuditEntries::Ocsf(
-            app.control
-                .ocsf_events(&rows, PromptText::from(q.prompt))
-                .await?,
-        ),
-    };
     Ok(Json(AuditDetail { audit }))
 }

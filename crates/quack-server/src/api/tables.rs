@@ -3,9 +3,9 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use quack_core::ids::WorkspaceId;
-use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::storage::control::AuditAction;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::state::{App, with_db};
 use quack_core::analysis::table_search;
@@ -38,8 +38,13 @@ pub(crate) async fn list(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<TableList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::List, "tables").await?;
-    let tables = app.read(&id, WorkspaceDb::list_tables).await?;
+    let tables = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "tables"),
+            app.read(&id, WorkspaceDb::list_tables),
+        )
+        .await?;
     Ok(Json(TableList { tables }))
 }
 
@@ -59,8 +64,14 @@ pub(crate) async fn schema(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<SqlSchema>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::List, "schema").await?;
-    Ok(Json(app.read(&id, WorkspaceDb::sql_schema).await?))
+    let schema = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "schema"),
+            app.read(&id, WorkspaceDb::sql_schema),
+        )
+        .await?;
+    Ok(Json(schema))
 }
 
 /// A statement being typed and the cursor's position in it, in characters.
@@ -92,15 +103,15 @@ pub(crate) async fn complete(
     Json(body): Json<CompleteSql>,
 ) -> ApiResult<Json<SqlCompletion>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Complete, "sql")
-        .await?;
-    let words = SqlVocabulary::duckdb()?;
     let CompleteSql { sql, cursor } = body;
-    let found = app
-        .read(&id, move |db| {
-            let schema = db.sql_schema()?;
-            Ok(SqlCompletion::for_sql(&sql, cursor, &schema, &words))
+    let found = access
+        .audited(&app, Audit::read(AuditAction::Complete, "sql"), async {
+            let words = SqlVocabulary::duckdb()?;
+            app.read(&id, move |db| {
+                let schema = db.sql_schema()?;
+                Ok(SqlCompletion::for_sql(&sql, cursor, &schema, &words))
+            })
+            .await
         })
         .await?;
     Ok(Json(found.unwrap_or(SqlCompletion {
@@ -208,19 +219,15 @@ impl Access {
             note.to_owned(),
             self.identity.username.clone(),
         );
-        let result = with_db(db, move |db| {
-            TableNote::set(db, &table, &text, Some(&editor))
+        let audit = Audit::of(AuditAction::TableNote)
+            .detail(serde_json::json!({ "table": name, "chars": note.trim().chars().count() }));
+        self.audited(app, audit, async {
+            with_db(db, move |db| {
+                TableNote::set(db, &table, &text, Some(&editor))
+            })
+            .await
         })
-        .await;
-        self.audit(
-            app,
-            AuditAction::TableNote,
-            None,
-            Outcome::of(&result),
-            Some(serde_json::json!({ "table": name, "chars": note.trim().chars().count() })),
-        )
-        .await?;
-        result
+        .await
     }
 
     /// Give one column of a user table another type, every value
@@ -232,35 +239,30 @@ impl Access {
         column: &str,
         to: &str,
     ) -> ApiResult<()> {
-        let to: ColumnType = to.parse()?;
-        if name.starts_with(INTERNAL_PREFIX) || views::is_reserved(name) {
-            return Err(ApiError::not_found("no such table"));
-        }
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let (table, col) = (name.to_owned(), column.to_owned());
-        let result = with_db(db, move |db| {
-            if !table_search::user_tables(db)?.contains(&table) {
-                return Ok(None);
-            }
-            Retype {
-                table: &table,
-                column: &col,
-                to,
-            }
-            .run(db)
-            .map(Some)
-        })
-        .await;
         let detail = serde_json::json!({ "table": name, "column": column, "type": to });
-        self.audit(
-            app,
-            AuditAction::Retype,
-            None,
-            Outcome::of(&result),
-            Some(detail),
-        )
-        .await?;
-        result?.ok_or_else(|| ApiError::not_found("no such table"))
+        self.audited(app, Audit::of(AuditAction::Retype).detail(detail), async {
+            let to: ColumnType = to.parse()?;
+            if name.starts_with(INTERNAL_PREFIX) || views::is_reserved(name) {
+                return Err(ApiError::not_found("no such table"));
+            }
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let (table, col) = (name.to_owned(), column.to_owned());
+            with_db(db, move |db| {
+                if !table_search::user_tables(db)?.contains(&table) {
+                    return Ok(None);
+                }
+                Retype {
+                    table: &table,
+                    column: &col,
+                    to,
+                }
+                .run(db)
+                .map(Some)
+            })
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such table"))
+        })
+        .await
     }
 
     /// One user table's columns and sample rows, from the API or the web
@@ -270,29 +272,23 @@ impl Access {
         app: &App,
         name: &str,
     ) -> ApiResult<TableDescription> {
-        if name.starts_with(INTERNAL_PREFIX) {
-            return Err(ApiError::not_found("no such table"));
-        }
-        let table = name.to_owned();
-        let described = app
-            .read(&self.membership.workspace.id, move |db| {
+        // The table name is user content: it goes in the workspace detail,
+        // not in control.db.
+        let audit = Audit::of(AuditAction::Open).detail(serde_json::json!({ "table": name }));
+        self.audited(app, audit, async {
+            if name.starts_with(INTERNAL_PREFIX) {
+                return Err(ApiError::not_found("no such table"));
+            }
+            let table = name.to_owned();
+            app.read(&self.membership.workspace.id, move |db| {
                 if !db.list_tables()?.contains(&table) {
                     return Ok(None);
                 }
                 db.describe_table(&table).map(Some)
             })
             .await?
-            .ok_or_else(|| ApiError::not_found("no such table"))?;
-        // The table name is user content: it goes in the workspace detail,
-        // not in control.db.
-        self.audit(
-            app,
-            AuditAction::Open,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({ "table": name })),
-        )
-        .await?;
-        Ok(described)
+            .ok_or_else(|| ApiError::not_found("no such table"))
+        })
+        .await
     }
 }

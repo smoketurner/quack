@@ -13,13 +13,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::ids::WorkspaceId;
 use quack_core::jobs::{JobId, JobInfo, JobKind};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
 use super::StreamEvent;
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::state::App;
 
@@ -69,32 +69,20 @@ impl Access {
 
     /// The cancel the API and the web page share, audited either way.
     pub(crate) async fn cancel_job(&self, app: &App, job: &str) -> ApiResult<JobInfo> {
-        let found = self.find_job(app, job)?;
-        let job_id = found.id.to_string();
-        if !self.may_cancel(&found) {
-            self.audit(
-                app,
-                AuditAction::Cancel,
-                Some(ResourceKind::Job.id(&job_id)),
-                Outcome::Denied,
-                None,
-            )
-            .await?;
-            return Err(ApiError::forbidden(
-                "only the job's owner, a workspace owner, or an admin may cancel it",
-            ));
-        }
-        let active = app.engine.jobs.cancel(found.id);
-        self.audit(
-            app,
-            AuditAction::Cancel,
-            Some(ResourceKind::Job.id(&job_id)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "kind": found.kind, "was_active": active })),
-        )
-        .await?;
-        let current = app.engine.jobs.get(found.id).unwrap_or(found);
-        Ok(self.redact(current))
+        self.audited_with(app, Audit::of(AuditAction::Cancel), async |audit| {
+            let found = self.find_job(app, job)?;
+            audit.set_resource(ResourceKind::Job, found.id.to_string());
+            if !self.may_cancel(&found) {
+                return Err(ApiError::forbidden(
+                    "only the job's owner, a workspace owner, or an admin may cancel it",
+                ));
+            }
+            let active = app.engine.jobs.cancel(found.id);
+            audit.set_detail(serde_json::json!({ "kind": found.kind, "was_active": active }));
+            let current = app.engine.jobs.get(found.id).unwrap_or(found);
+            Ok(self.redact(current))
+        })
+        .await
     }
 }
 
@@ -120,14 +108,17 @@ pub(crate) async fn list(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<JobList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::List, "jobs").await?;
-    let jobs = access.visible_jobs(&app);
-    let counts = app.engine.jobs.counts(Some(&id));
-    Ok(Json(JobList {
-        jobs,
-        queued: counts.queued,
-        running: counts.running,
-    }))
+    let list = access
+        .audited(&app, Audit::read(AuditAction::List, "jobs"), async {
+            let counts = app.engine.jobs.counts(Some(&id));
+            Ok(JobList {
+                jobs: access.visible_jobs(&app),
+                queued: counts.queued,
+                running: counts.running,
+            })
+        })
+        .await?;
+    Ok(Json(list))
 }
 
 /// One job.
@@ -143,8 +134,11 @@ pub(crate) async fn show(
     Path((id, job)): Path<(WorkspaceId, String)>,
 ) -> ApiResult<Json<JobInfo>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Show, "job").await?;
-    let job = access.find_job(&app, &job)?;
+    let job = access
+        .audited(&app, Audit::read(AuditAction::Show, "job"), async {
+            access.find_job(&app, &job)
+        })
+        .await?;
     Ok(Json(access.redact(job)))
 }
 
@@ -188,7 +182,11 @@ pub(crate) async fn stream(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Stream, "jobs").await?;
+    access
+        .audited(&app, Audit::read(AuditAction::Stream, "jobs"), async {
+            Ok(())
+        })
+        .await?;
     let receiver = app.engine.jobs.subscribe();
     let stopping = app.engine.stopping();
     let first = StreamEvent::Jobs

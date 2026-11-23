@@ -24,12 +24,12 @@ use quack_core::ids::{ClassId, EdgeId, NodeId, RelationId, RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
 use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::okf::Download;
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::run::{self, BackgroundRun, GraphReport, RunKind};
 use crate::state::{App, ExtractionSlot, with_db};
@@ -58,36 +58,20 @@ pub(crate) async fn search(
     Json(q): Json<SearchGraphArgs>,
 ) -> ApiResult<Json<GraphResult>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = q
-        .query()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.engine.config.graph;
-    let detail = serde_json::to_value(&query)?;
-    let model = access
-        .model(
-            &app,
-            AuditAction::Graph,
-            Embeddings::from_config(&app.engine.config).await,
-        )
+    let result = access
+        .audited_with(&app, Audit::of(AuditAction::Graph), async |audit| {
+            let query = q
+                .query()
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            audit.set_detail(serde_json::to_value(&query)?);
+            let model = Embeddings::from_config(&app.engine.config).await?;
+            let embedding = query.embedding(model.as_ref()).await?;
+            app.read(&id, move |db| query.run(db, embedding.as_ref(), &options))
+                .await
+        })
         .await?;
-    // Run, audit the outcome, then propagate, so a failure after
-    // authorization is recorded as an error rather than dropped.
-    let result: ApiResult<_> = async {
-        let embedding = query.embedding(model.as_ref()).await?;
-        app.read(&id, move |db| query.run(db, embedding.as_ref(), &options))
-            .await
-    }
-    .await;
-    access
-        .audit(
-            &app,
-            AuditAction::Graph,
-            None,
-            Outcome::of(&result),
-            Some(detail),
-        )
-        .await?;
-    Ok(Json(result?))
+    Ok(Json(result))
 }
 
 /// The shortest path between two entities.
@@ -106,35 +90,20 @@ pub(crate) async fn path(
     Json(q): Json<FindPathArgs>,
 ) -> ApiResult<Json<GraphResult>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = q
-        .query()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.engine.config.graph;
-    let detail = serde_json::to_value(&query)?;
-    let model = access
-        .model(
-            &app,
-            AuditAction::Graph,
-            Embeddings::from_config(&app.engine.config).await,
-        )
+    let result = access
+        .audited_with(&app, Audit::of(AuditAction::Graph), async |audit| {
+            let query = q
+                .query()
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            audit.set_detail(serde_json::to_value(&query)?);
+            let model = Embeddings::from_config(&app.engine.config).await?;
+            let ends = query.embeddings(model.as_ref()).await?;
+            app.read(&id, move |db| query.run(db, &ends, &options))
+                .await
+        })
         .await?;
-    // Run, audit the outcome, then propagate (see `search`).
-    let result: ApiResult<_> = async {
-        let ends = query.embeddings(model.as_ref()).await?;
-        app.read(&id, move |db| query.run(db, &ends, &options))
-            .await
-    }
-    .await;
-    access
-        .audit(
-            &app,
-            AuditAction::Graph,
-            None,
-            Outcome::of(&result),
-            Some(detail),
-        )
-        .await?;
-    Ok(Json(result?))
+    Ok(Json(result))
 }
 
 /// The graph's size, and what is stale or pending.
@@ -151,10 +120,13 @@ pub(crate) async fn status(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<GraphStatus>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "graph_status")
+    let status = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "graph_status"),
+            app.read(&id, graph_store::status),
+        )
         .await?;
-    let status = app.read(&id, graph_store::status).await?;
     Ok(Json(status))
 }
 
@@ -312,6 +284,20 @@ impl Access {
         app: &App,
         plan: &ExtractionPlan,
     ) -> ApiResult<ExtractionStarted> {
+        self.audited_with(app, Audit::of(AuditAction::GraphExtract), async |audit| {
+            self.extract(app, plan, audit).await
+        })
+        .await
+    }
+
+    /// The work of [`Access::start_extraction`]; a document pass is audited
+    /// by its run, anything else by the caller's row.
+    async fn extract(
+        &self,
+        app: &App,
+        plan: &ExtractionPlan,
+        audit: &mut Audit,
+    ) -> ApiResult<ExtractionStarted> {
         let (access, id) = (self, &self.membership.workspace.id);
         let (sample, reset) = (plan.sample, plan.reset);
         let slot = app.begin_extraction(id).ok_or_else(|| {
@@ -329,13 +315,7 @@ impl Access {
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
         let options = app.engine.config.graph;
-        let embeddings = access
-            .model(
-                app,
-                AuditAction::GraphExtract,
-                Embeddings::from_config(&app.engine.config).await,
-            )
-            .await?;
+        let embeddings = Embeddings::from_config(&app.engine.config).await?;
         if let Some(keep) = reset {
             with_db(Arc::clone(&db), move |db| graph_store::clear(db, keep)).await?;
         }
@@ -355,28 +335,16 @@ impl Access {
                 graph_store::set_built_with(db, version)
             })
             .await?;
-            access
-                .audit(
-                    app,
-                    AuditAction::GraphExtract,
-                    None,
-                    Outcome::Allowed,
-                    Some(serde_json::json!({ "tables": table_summaries, "resolution": summary })),
-                )
-                .await?;
+            audit.set_detail(
+                serde_json::json!({ "tables": table_summaries, "resolution": summary }),
+            );
             return Ok(ExtractionStarted::Done {
                 tables: table_summaries,
                 resolution: summary,
             });
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = access
-            .model(
-                app,
-                AuditAction::GraphExtract,
-                llm::graph_extractor(&app.engine.config, &ontology).await,
-            )
-            .await?;
+        let extractor = llm::graph_extractor(&app.engine.config, &ontology).await?;
         let cost = ExtractionCost {
             chunks: chunks.len(),
             model: app.engine.config.chat_model_ref()?.to_string(),
@@ -388,6 +356,7 @@ impl Access {
             serde_json::json!({ "tables": table_summaries, "cost": cost }),
         )
         .await?;
+        audit.already_recorded();
         let run_id = run.id().clone();
         let job = DocumentJob {
             db,
@@ -541,10 +510,14 @@ pub(crate) async fn revalidation_preview(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<Revalidation>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "graph_revalidation")
+    let preview = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "graph_revalidation"),
+            app.read(&id, Revalidation::preview),
+        )
         .await?;
-    Ok(Json(app.read(&id, Revalidation::preview).await?))
+    Ok(Json(preview))
 }
 
 /// Drop what the preview counted. The body carries the preview's totals;
@@ -637,10 +610,13 @@ pub(crate) async fn merges(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<MergeList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "graph_merges")
+    let pending = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "graph_merges"),
+            app.read(&id, resolve::pending),
+        )
         .await?;
-    let pending = app.read(&id, resolve::pending).await?;
     Ok(Json(MergeList { merges: pending }))
 }
 
@@ -678,38 +654,38 @@ impl Access {
         app: &App,
         approval: DropApproval,
     ) -> ApiResult<Revalidation> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let outcome = with_db(db, move |db| {
-            if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
-                return Ok(Err(refusal));
-            }
-            graph_store::revalidate(db).map(Ok)
-        })
-        .await
-        .map_err(|e| ApiError::bad_request(e.message))?
-        .map_err(ApiError::conflict)?;
-        self.audit(
+        self.audited_with(
             app,
-            AuditAction::GraphRevalidate,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::to_value(&outcome)?),
+            Audit::of(AuditAction::GraphRevalidate),
+            async |audit| {
+                let db = app.workspace(&self.membership.workspace.id).await?.writer;
+                let outcome = with_db(db, move |db| {
+                    if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
+                        return Ok(Err(refusal));
+                    }
+                    graph_store::revalidate(db).map(Ok)
+                })
+                .await
+                .map_err(|e| ApiError::bad_request(e.message))?
+                .map_err(ApiError::conflict)?;
+                audit.set_detail(serde_json::to_value(&outcome)?);
+                Ok(outcome)
+            },
         )
-        .await?;
-        Ok(outcome)
+        .await
     }
 
     /// Mark the provisional graph reviewed.
     pub(crate) async fn review_graph(&self, app: &App) -> ApiResult<GraphStatus> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let status = with_db(db, |db| {
-            graph_store::mark_reviewed(db)?;
-            graph_store::status(db)
+        self.audited(app, Audit::of(AuditAction::GraphReview), async {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            with_db(db, |db| {
+                graph_store::mark_reviewed(db)?;
+                graph_store::status(db)
+            })
+            .await
         })
-        .await?;
-        self.audit(app, AuditAction::GraphReview, None, Outcome::Allowed, None)
-            .await?;
-        Ok(status)
+        .await
     }
 
     /// Accept or reject one merge proposal.
@@ -719,22 +695,26 @@ impl Access {
         merge: &str,
         decision: MergeDecision,
     ) -> ApiResult<MergeProposal> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let merge_id = merge.to_owned();
-        let proposal = with_db(db, move |db| {
-            resolve::decide(db, &merge_id, decision, Some(&author))
+        let accept = decision == MergeDecision::Accept;
+        let audit = Audit::of(AuditAction::GraphMerge)
+            .resource(ResourceKind::GraphMerge, merge)
+            .detail(serde_json::json!({ "accept": accept }));
+        self.audited_with(app, audit, async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let merge_id = merge.to_owned();
+            let proposal = with_db(db, move |db| {
+                resolve::decide(db, &merge_id, decision, Some(&author))
+            })
+            .await?;
+            audit.set_detail(serde_json::json!({
+                "accept": accept,
+                "keep": proposal.keep.label,
+                "drop": proposal.drop.label,
+            }));
+            Ok(proposal)
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::GraphMerge,
-            Some(ResourceKind::GraphMerge.id(merge)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "accept": decision == MergeDecision::Accept, "keep": proposal.keep.label, "drop": proposal.drop.label })),
-        )
-        .await?;
-        Ok(proposal)
+        .await
     }
 }
 
@@ -892,6 +872,18 @@ impl EditDetail {
             "note": self.note,
         })
     }
+
+    /// The audit of an edit that has not run yet: what was asked.
+    fn audit(op: &'static str, note: Option<String>) -> Audit {
+        let asked = Self {
+            op,
+            label: None,
+            class: None,
+            relation: None,
+            note,
+        };
+        Audit::of(AuditAction::GraphEdit).detail(asked.json())
+    }
 }
 
 /// A person's graph edits, shared by the API and the graph page: each
@@ -905,56 +897,39 @@ impl Access {
         }
     }
 
-    /// Record a graph edit that went through.
-    async fn audit_edit(
-        &self,
-        app: &App,
-        kind: ResourceKind,
-        id: &str,
-        detail: EditDetail,
-    ) -> ApiResult<()> {
-        self.audit(
-            app,
-            AuditAction::GraphEdit,
-            Some(kind.id(id)),
-            Outcome::Allowed,
-            Some(detail.json()),
-        )
-        .await?;
-        Ok(())
-    }
-
     pub(crate) async fn create_node(
         &self,
         app: &App,
         body: CreateNode,
     ) -> ApiResult<Asserted<Node>> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let assertion = self.assertion(body.note.clone());
-        let node = NewNode {
-            label: body.label,
-            class_id: body.class,
-            properties: body.properties,
-            standing: Standing::Reviewed,
-        };
-        let added = with_db(db, move |db| {
-            graph_store::create_node(db, &node, &assertion)
+        let audit = EditDetail::audit("create", body.note.clone());
+        self.audited_with(app, audit, async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let assertion = self.assertion(body.note.clone());
+            let node = NewNode {
+                label: body.label,
+                class_id: body.class,
+                properties: body.properties,
+                standing: Standing::Reviewed,
+            };
+            let added = with_db(db, move |db| {
+                graph_store::create_node(db, &node, &assertion)
+            })
+            .await?;
+            audit.set_resource(ResourceKind::GraphNode, added.subject.id.as_str());
+            audit.set_detail(
+                EditDetail {
+                    op: if added.created { "create" } else { "assert" },
+                    label: Some(added.subject.label.clone()),
+                    class: Some(added.subject.class_id.to_string()),
+                    relation: None,
+                    note: body.note,
+                }
+                .json(),
+            );
+            Ok(added)
         })
-        .await?;
-        self.audit_edit(
-            app,
-            ResourceKind::GraphNode,
-            added.subject.id.as_str(),
-            EditDetail {
-                op: if added.created { "create" } else { "assert" },
-                label: Some(added.subject.label.clone()),
-                class: Some(added.subject.class_id.to_string()),
-                relation: None,
-                note: body.note,
-            },
-        )
-        .await?;
-        Ok(added)
+        .await
     }
 
     pub(crate) async fn update_node(
@@ -963,52 +938,56 @@ impl Access {
         id: &NodeId,
         body: UpdateNode,
     ) -> ApiResult<Node> {
-        if body.edit.is_empty() {
-            return Err(ApiError::bad_request(
-                "nothing to change: give label, class, or properties",
-            ));
-        }
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let assertion = self.assertion(body.note.clone());
-        let (nid, edit) = (id.clone(), body.edit);
-        let node = with_db(db, move |db| {
-            graph_store::update_node(db, &nid, &edit, &assertion)
+        let audit = EditDetail::audit("update", body.note.clone())
+            .resource(ResourceKind::GraphNode, id.as_str());
+        self.audited_with(app, audit, async |audit| {
+            if body.edit.is_empty() {
+                return Err(ApiError::bad_request(
+                    "nothing to change: give label, class, or properties",
+                ));
+            }
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let assertion = self.assertion(body.note.clone());
+            let (nid, edit) = (id.clone(), body.edit);
+            let node = with_db(db, move |db| {
+                graph_store::update_node(db, &nid, &edit, &assertion)
+            })
+            .await?;
+            audit.set_detail(
+                EditDetail {
+                    op: "update",
+                    label: Some(node.label.clone()),
+                    class: Some(node.class_id.to_string()),
+                    relation: None,
+                    note: body.note,
+                }
+                .json(),
+            );
+            Ok(node)
         })
-        .await?;
-        self.audit_edit(
-            app,
-            ResourceKind::GraphNode,
-            id.as_str(),
-            EditDetail {
-                op: "update",
-                label: Some(node.label.clone()),
-                class: Some(node.class_id.to_string()),
-                relation: None,
-                note: body.note,
-            },
-        )
-        .await?;
-        Ok(node)
+        .await
     }
 
     pub(crate) async fn delete_node(&self, app: &App, id: &NodeId) -> ApiResult<Node> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let nid = id.clone();
-        let node = with_db(db, move |db| graph_store::delete_node(db, &nid)).await?;
-        self.audit_edit(
-            app,
-            ResourceKind::GraphNode,
-            id.as_str(),
-            EditDetail {
-                op: "delete",
-                label: Some(node.label.clone()),
-                class: Some(node.class_id.to_string()),
-                relation: None,
-                note: None,
-            },
-        )
-        .await?;
-        Ok(node)
+        let audit =
+            EditDetail::audit("delete", None).resource(ResourceKind::GraphNode, id.as_str());
+        self.audited_with(app, audit, async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let nid = id.clone();
+            let node = with_db(db, move |db| graph_store::delete_node(db, &nid)).await?;
+            audit.set_detail(
+                EditDetail {
+                    op: "delete",
+                    label: Some(node.label.clone()),
+                    class: Some(node.class_id.to_string()),
+                    relation: None,
+                    note: None,
+                }
+                .json(),
+            );
+            Ok(node)
+        })
+        .await
     }
 
     pub(crate) async fn create_edge(
@@ -1016,51 +995,55 @@ impl Access {
         app: &App,
         body: CreateEdge,
     ) -> ApiResult<Asserted<Edge>> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let assertion = self.assertion(body.note.clone());
-        let edge = NewEdge {
-            source: body.source,
-            target: body.target,
-            relation: body.relation,
-            properties: body.properties,
-        };
-        let added = with_db(db, move |db| {
-            graph_store::create_edge(db, &edge, &assertion)
+        let audit = EditDetail::audit("create", body.note.clone());
+        self.audited_with(app, audit, async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let assertion = self.assertion(body.note.clone());
+            let edge = NewEdge {
+                source: body.source,
+                target: body.target,
+                relation: body.relation,
+                properties: body.properties,
+            };
+            let added = with_db(db, move |db| {
+                graph_store::create_edge(db, &edge, &assertion)
+            })
+            .await?;
+            audit.set_resource(ResourceKind::GraphEdge, added.subject.id.as_str());
+            audit.set_detail(
+                EditDetail {
+                    op: if added.created { "create" } else { "assert" },
+                    label: None,
+                    class: None,
+                    relation: Some(added.subject.relation_id.to_string()),
+                    note: body.note,
+                }
+                .json(),
+            );
+            Ok(added)
         })
-        .await?;
-        self.audit_edit(
-            app,
-            ResourceKind::GraphEdge,
-            added.subject.id.as_str(),
-            EditDetail {
-                op: if added.created { "create" } else { "assert" },
-                label: None,
-                class: None,
-                relation: Some(added.subject.relation_id.to_string()),
-                note: body.note,
-            },
-        )
-        .await?;
-        Ok(added)
+        .await
     }
 
     pub(crate) async fn delete_edge(&self, app: &App, id: &EdgeId) -> ApiResult<Edge> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let eid = id.clone();
-        let edge = with_db(db, move |db| graph_store::delete_edge(db, &eid)).await?;
-        self.audit_edit(
-            app,
-            ResourceKind::GraphEdge,
-            id.as_str(),
-            EditDetail {
-                op: "delete",
-                label: None,
-                class: None,
-                relation: Some(edge.relation_id.to_string()),
-                note: None,
-            },
-        )
-        .await?;
-        Ok(edge)
+        let audit =
+            EditDetail::audit("delete", None).resource(ResourceKind::GraphEdge, id.as_str());
+        self.audited_with(app, audit, async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let eid = id.clone();
+            let edge = with_db(db, move |db| graph_store::delete_edge(db, &eid)).await?;
+            audit.set_detail(
+                EditDetail {
+                    op: "delete",
+                    label: None,
+                    class: None,
+                    relation: Some(edge.relation_id.to_string()),
+                    note: None,
+                }
+                .json(),
+            );
+            Ok(edge)
+        })
+        .await
     }
 }
