@@ -103,9 +103,8 @@ pub(crate) struct NewMember {
 
 impl Access {
     /// Give a user a role in this workspace, from the API or the web
-    /// console; an existing member's role changes. Answers `Gone` when the
-    /// membership was removed between the role read and the role change, so
-    /// the response never reports a role the database does not reflect.
+    /// console; an existing member's role changes. `Gone` when the
+    /// membership was removed while its role was being changed.
     pub(crate) async fn add_member(&self, app: &App, member: &AddMember) -> ApiResult<NewMember> {
         let user = app
             .control
@@ -148,9 +147,6 @@ impl Access {
                 entry.clone(),
             )
             .await?;
-        // A membership that was removed between `set_member`'s read and its
-        // `UPDATE` is a no-op audited as `Error`: record why, and answer
-        // `Gone` rather than reporting a role the database does not reflect.
         let detail = if added {
             detail
         } else {

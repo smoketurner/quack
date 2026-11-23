@@ -2650,13 +2650,8 @@ impl ControlPlane {
     // --- members ------------------------------------------------------------
 
     /// Add or change a membership, and record `audit` in the same
-    /// transaction. Returns whether a row was added or changed: a
-    /// membership that stood when `member_role` read it can be removed in
-    /// another task before this `UPDATE` runs (the read and the write are
-    /// separate pool acquisitions), and the `UPDATE` then touches no row.
-    /// `commit_audited` audits that no-op as `Outcome::Error` and this
-    /// returns `false`, so a caller that reports success only on `true`
-    /// never claims a role the database does not reflect.
+    /// transaction. Returns whether a row changed: a membership removed
+    /// after `member_role` read it leaves the `UPDATE` nothing to change.
     ///
     /// # Errors
     ///
