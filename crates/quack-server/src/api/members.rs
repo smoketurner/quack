@@ -103,7 +103,9 @@ pub(crate) struct NewMember {
 
 impl Access {
     /// Give a user a role in this workspace, from the API or the web
-    /// console; an existing member's role changes.
+    /// console; an existing member's role changes. Answers `Gone` when the
+    /// membership was removed between the role read and the role change, so
+    /// the response never reports a role the database does not reflect.
     pub(crate) async fn add_member(&self, app: &App, member: &AddMember) -> ApiResult<NewMember> {
         let user = app
             .control
@@ -137,7 +139,8 @@ impl Access {
             )
         };
         let entry = self.entry(action, Outcome::Allowed);
-        app.control
+        let added = app
+            .control
             .set_member(
                 &self.membership.workspace.id,
                 &user.id,
@@ -145,12 +148,27 @@ impl Access {
                 entry.clone(),
             )
             .await?;
+        // A membership that was removed between `set_member`'s read and its
+        // `UPDATE` is a no-op audited as `Error`: record why, and answer
+        // `Gone` rather than reporting a role the database does not reflect.
+        let detail = if added {
+            detail
+        } else {
+            serde_json::json!({ "role": member.role, "reason": "no longer a member" })
+        };
         self.record_detail(app, &entry, Some(detail)).await?;
-        Ok(NewMember {
-            user_id: user.id,
-            username: user.username,
-            role: member.role,
-        })
+        if added {
+            Ok(NewMember {
+                user_id: user.id,
+                username: user.username,
+                role: member.role,
+            })
+        } else {
+            Err(ApiError::gone(
+                "the membership was removed while the role was being changed; nothing was \
+                 changed",
+            ))
+        }
     }
 
     /// Take a user out of this workspace; one who was not a member is an

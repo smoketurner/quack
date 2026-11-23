@@ -2650,7 +2650,13 @@ impl ControlPlane {
     // --- members ------------------------------------------------------------
 
     /// Add or change a membership, and record `audit` in the same
-    /// transaction.
+    /// transaction. Returns whether a row was added or changed: a
+    /// membership that stood when `member_role` read it can be removed in
+    /// another task before this `UPDATE` runs (the read and the write are
+    /// separate pool acquisitions), and the `UPDATE` then touches no row.
+    /// `commit_audited` audits that no-op as `Outcome::Error` and this
+    /// returns `false`, so a caller that reports success only on `true`
+    /// never claims a role the database does not reflect.
     ///
     /// # Errors
     ///
@@ -2662,7 +2668,7 @@ impl ControlPlane {
         user_id: &UserId,
         role: Role,
         audit: AuditEntry,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let existing = self.member_role(workspace_id, user_id).await?;
         let bound = if existing.is_some() {
             Bound::new(
@@ -2679,7 +2685,8 @@ impl ControlPlane {
         let audit = audit
             .in_workspace(workspace_id)
             .on(ResourceKind::User.id(user_id.as_str()));
-        self.commit_audited(vec![bound], audit)
+        let changed = self
+            .commit_audited(vec![bound], audit)
             .await
             .map_err(|e| match &e {
                 Error::Sqlite(sqlx::Error::Database(db)) if db.is_foreign_key_violation() => {
@@ -2689,7 +2696,7 @@ impl ControlPlane {
                 }
                 _ => e,
             })?;
-        Ok(())
+        Ok(changed)
     }
 
     fn member_insert(
