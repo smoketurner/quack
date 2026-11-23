@@ -10,7 +10,7 @@ use crate::llm::oauth::registration::{
     SignIn as SignInWith, SignedInRegistration, TemporaryClient, metadata_for,
 };
 use crate::oidc::SignIn;
-use crate::storage::control::{ControlPlane, SealedOwner};
+use crate::storage::control::{ControlPlane, KeyChange, Previous, RegistrationRow, SealedOwner};
 
 /// quack's configuration for one Vouch-like issuer: sign-in and an
 /// on-behalf-of provider without an actor, both without a `client_id`, and
@@ -1094,6 +1094,105 @@ async fn a_temporary_client_left_behind_is_recorded_and_deleted_later() {
             .await
             .is_ok_and(|l| l.is_empty())
     );
+}
+
+/// An issuer that registers the temporary sign-in client without a
+/// `registration_access_token` (RFC 7592) leaves quack nothing to delete it
+/// with: the record is forgotten and the user is told to delete it in the
+/// issuer's console, not to wait for a retry that cannot happen.
+#[tokio::test]
+async fn an_unmanaged_temporary_client_is_forgotten_and_reported_as_unmanaged() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = registered_config(dir.path(), &idp.issuer, "");
+    let issuer = RegistrationName::new(&idp.issuer);
+    let registrar = registrar(&config);
+    let metadata = metadata(&config, &registrar, &issuer).await;
+    idp.state
+        .omit_registration_token
+        .store(true, Ordering::SeqCst);
+
+    let done = sign_in_and_register(&registrar, &issuer, &metadata)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    // The temporary client is reported as Unmanaged, not Left: quack cannot
+    // delete it and has forgotten its record.
+    assert_eq!(
+        done.temporary,
+        TemporaryClient::Unmanaged {
+            client_id: String::from("client-1")
+        }
+    );
+    assert!(done.earlier.is_empty());
+    assert_eq!(done.registered.client_id, "client-2");
+    // The record is gone, so there is nothing for a next run or `quack
+    // doctor` to find.
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty()),
+        "the record is forgotten"
+    );
+    // No RFC 7592 DELETE was sent: the temporary client is still registered
+    // at the issuer.
+    assert!(!deleted(&idp, "client-1"));
+}
+
+/// An earlier run's temporary client that the issuer registered without a
+/// `registration_access_token` is forgotten and reported as Unmanaged by
+/// `clean_up_sign_in`, not left for a retry that cannot happen.
+#[tokio::test]
+async fn an_unmanaged_earlier_leftover_is_forgotten_and_reported_as_unmanaged() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = registered_config(dir.path(), &idp.issuer, "");
+    let issuer = RegistrationName::new(&idp.issuer);
+    let registrar = registrar(&config);
+
+    // Simulate an interrupted run that registered a temporary client
+    // without a registration access token and was stopped before it could
+    // clean up: the record has no token and no `registration_client_uri`.
+    let row = RegistrationRow {
+        name: format!("sign-in {issuer} client-1"),
+        client_id: String::from("client-1"),
+        registration_client_uri: None,
+        token: None,
+    };
+    let control = ControlPlane::open(&config)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        control
+            .save_registration(&row, Previous::Nothing, KeyChange::default())
+            .await
+            .is_ok_and(|saved| saved)
+    );
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l == ["client-1"])
+    );
+
+    // The next `quack auth register` cleans it up.
+    let cleaned = registrar.clean_up_sign_in(&issuer).await;
+    assert_eq!(
+        cleaned.ok(),
+        Some(vec![TemporaryClient::Unmanaged {
+            client_id: String::from("client-1")
+        }])
+    );
+    // The record is gone.
+    assert!(
+        registrar
+            .sign_in_leftovers(&issuer)
+            .await
+            .is_ok_and(|l| l.is_empty())
+    );
+    // No RFC 7592 DELETE was sent.
+    assert!(!deleted(&idp, "client-1"));
 }
 
 /// Signing in before registering is chosen from the issuer's discovery
