@@ -14,7 +14,7 @@ use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::{Cookie, SameSite};
+use cookie::{Cookie, SameSite};
 use quack_core::storage::control;
 
 use crate::auth::Peer;
