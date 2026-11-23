@@ -48,6 +48,9 @@ pub struct Revision<'a> {
     /// and moves `since_version`, pending candidates, and the graph's
     /// nodes and edges to the new ids.
     pub renames: Option<&'a IdRenames>,
+    /// Candidates this version decides: marked in the save's transaction,
+    /// so a version and its candidates' statuses commit together.
+    pub decided: Option<&'a candidates::Decided<'a>>,
 }
 
 impl<'a> Revision<'a> {
@@ -58,6 +61,7 @@ impl<'a> Revision<'a> {
             note,
             acceptance: Acceptance::Reviewed,
             renames: None,
+            decided: None,
         }
     }
 
@@ -68,6 +72,7 @@ impl<'a> Revision<'a> {
             note,
             acceptance: Acceptance::Auto,
             renames: None,
+            decided: None,
         }
     }
 
@@ -325,6 +330,9 @@ pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Re
         if let Some(renames) = revision.renames {
             candidates::rename_ids(db, renames)?;
             graph_store::rename_ids(db, renames, next)?;
+        }
+        if let Some(decided) = revision.decided {
+            decided.mark(db)?;
         }
         views::ensure(db, &stored)?;
         Ok(stored)
@@ -691,6 +699,7 @@ pub fn rename(db: &WorkspaceDb, renames: &IdRenames, author: Option<&str>) -> Re
             note: Some(&format!("renamed {renames}")),
             acceptance,
             renames: Some(renames),
+            decided: None,
         },
     )
 }
