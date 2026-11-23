@@ -550,7 +550,10 @@ the place of: `quack ingest --replace [ID]`, `POST .../documents?replace={doc}`,
 Documents row's Replace control). The old document keeps serving, marked `superseded_by`,
 until the new one is `ready`; then it becomes `DocumentStatus::Superseded`, its pin moves
 over, and its tables the new one did not load over are dropped (`WorkspaceDb::complete_document`);
-a failure clears the mark (`WorkspaceDb::fail_document`). Each step is one transaction
+a failure clears the mark (`WorkspaceDb::fail_document`). A table name is claimed in the writer step
+that checks it is free (`ingestion::claim::TableName::claim`, recorded in the document's `tables` at once,
+released when the document fails), so a racing ingest of the same name gets `Error::TableTaken`; the
+loaders take the claim, so no path creates a table without one. Each step is one transaction
 (`insert_document_replacing` marks and registers together), and `fail_stale_uploads` finishes or
 abandons any replacement a crash interrupted. A table file loads over its predecessor's table. A superseded document leaves search, the
 prompt, `list_documents`, and `read_document`, but keeps its chunks so stored citations still
