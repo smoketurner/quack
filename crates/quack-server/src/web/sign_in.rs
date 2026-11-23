@@ -4,7 +4,7 @@
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::{Cookie, SameSite};
+use cookie::{Cookie, SameSite};
 use quack_core::config::OidcConfig;
 use quack_core::error::Error as CoreError;
 use quack_core::oidc::SignedIn;
