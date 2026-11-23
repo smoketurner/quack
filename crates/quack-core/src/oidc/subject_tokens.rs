@@ -14,7 +14,7 @@ use secrecy::SecretString;
 use super::{Renewal, SignIn, UserTokens};
 use crate::error::Result;
 use crate::ids::UserId;
-use crate::llm::oauth::CachedToken;
+use crate::llm::oauth::{CachedToken, TokenManager};
 use crate::storage::control::{ControlPlane, Origin};
 use crate::web_sessions::WebSessions;
 
@@ -118,7 +118,10 @@ impl SubjectTokens {
     /// Forget a person's stored token unless `in_use` (asked under the
     /// per-user lock, after any sign-in in progress has stored its token and
     /// opened its session) says something still needs it. Returns whether
-    /// it was forgotten.
+    /// it was forgotten. When the token is forgotten, the person's
+    /// on-behalf-of delegated tokens are evicted from every registered
+    /// provider manager, so a long-lived `quack serve` cannot accumulate
+    /// one entry per distinct user without bound.
     ///
     /// # Errors
     ///
@@ -134,6 +137,7 @@ impl SubjectTokens {
             return Ok(false);
         }
         self.tokens.clear(&self.control, user).await?;
+        TokenManager::evict_all_delegated(user);
         Ok(true)
     }
 
@@ -199,7 +203,9 @@ impl SubjectTokens {
 
     /// End a sign-in the issuer no longer vouches for: the stored and
     /// presented tokens, every session, and a denied `session` row from
-    /// `origin`. The caller holds the user's renewal lock.
+    /// `origin`. The caller holds the user's renewal lock. The person's
+    /// on-behalf-of delegated tokens are evicted too, so a revoked user's
+    /// entry does not linger with an expired token after their sessions close.
     async fn end_sign_in(&self, user: &UserId, origin: &Origin, reason: &str) -> Result<()> {
         tracing::info!(user = %user, %reason, "the issuer ended the sign-in");
         self.tokens.clear(&self.control, user).await?;
@@ -216,6 +222,7 @@ impl SubjectTokens {
             *count = count.saturating_add(1);
         }
         self.sessions.close_user(user);
+        TokenManager::evict_all_delegated(user);
         self.control
             .record_audit(&origin.denied_session(user))
             .await

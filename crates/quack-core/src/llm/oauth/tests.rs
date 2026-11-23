@@ -1333,6 +1333,121 @@ async fn a_refused_exchange_names_the_issuers_error() {
     assert!(!last_body(&idp).contains("actor_token"));
 }
 
+#[tokio::test]
+async fn evicting_a_delegated_token_removes_the_entry_and_forces_a_re_exchange() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |_| {});
+
+    // Exchange for ada: one round-trip to the IdP.
+    let ada = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(ada.is_ok_and(|t| t.expose_secret() == "obo-ada-at-0"));
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 1);
+
+    // Reuse: no new exchange.
+    let again = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(again.is_ok_and(|t| t.expose_secret() == "obo-ada-at-0"));
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 1);
+
+    // The entry is in the map.
+    assert!(
+        m.delegated
+            .lock()
+            .is_ok_and(|d| d.contains_key(&UserId::from("ada"))),
+        "delegated map should contain ada before eviction"
+    );
+
+    // Evict ada's entry.
+    m.evict_delegated(&UserId::from("ada"));
+    assert!(
+        m.delegated.lock().is_ok_and(|d| d.is_empty()),
+        "delegated map should be empty after eviction"
+    );
+
+    // The next request for ada is a new exchange, not a reuse.
+    let after = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(after.is_ok_and(|t| t.expose_secret() == "obo-ada-at-1"));
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn evicting_one_users_delegated_token_does_not_evict_another_users() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |_| {});
+
+    // Exchange for both ada and bob.
+    let ada = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(ada.is_ok());
+    let bob = Acting::scope(Some(acting("bob", Some("bob-at"))), m.access_token()).await;
+    assert!(bob.is_ok());
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 2);
+
+    // Evict only ada.
+    m.evict_delegated(&UserId::from("ada"));
+    assert!(
+        m.delegated.lock().is_ok_and(
+            |d| d.contains_key(&UserId::from("bob")) && !d.contains_key(&UserId::from("ada"))
+        ),
+        "bob should remain, ada should be gone"
+    );
+
+    // Bob reuses; ada re-exchanges.
+    let bob_again = Acting::scope(Some(acting("bob", Some("bob-at"))), m.access_token()).await;
+    assert!(bob_again.is_ok_and(|t| t.expose_secret() == "obo-bob-at-1"));
+    let ada_again = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(ada_again.is_ok_and(|t| t.expose_secret() == "obo-ada-at-2"));
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn evicting_all_delegated_removes_from_every_registered_manager() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let config = oauth_config(&idp.issuer, Grant::OnBehalfOf);
+    let m = TokenManager::shared(&config_at(dir.path()), &name("shared-evict"), &config)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    // Exchange for ada through the shared manager.
+    let ada = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(ada.is_ok());
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 1);
+
+    // Evict from all registered managers.
+    TokenManager::evict_all_delegated(&UserId::from("ada"));
+    assert!(
+        m.delegated.lock().is_ok_and(|d| d.is_empty()),
+        "delegated map should be empty after evict_all_delegated"
+    );
+
+    // The next request is a new exchange.
+    let after = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(after.is_ok());
+    assert_eq!(idp.state.exchanges.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn evicting_all_delegated_is_a_noop_when_no_manager_is_registered() {
+    // The CLI path uses TokenManager::new, not shared, so the registry is empty.
+    // evict_all_delegated must not panic or error.
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = obo(dir.path(), &idp, |_| {});
+    let ada = Acting::scope(Some(acting("ada", Some("ada-at"))), m.access_token()).await;
+    assert!(ada.is_ok());
+
+    // This is a no-op: the registry has no managers from new().
+    TokenManager::evict_all_delegated(&UserId::from("ada"));
+
+    // The entry is still there (evict_all_delegated did not touch it).
+    assert!(
+        m.delegated
+            .lock()
+            .is_ok_and(|d| d.contains_key(&UserId::from("ada"))),
+        "a manager built with new() is not in the registry"
+    );
+}
+
 // --- discovery ---------------------------------------------------------------
 
 #[test]

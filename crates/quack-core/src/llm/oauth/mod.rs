@@ -537,6 +537,14 @@ struct ManagerKey {
     provider: ProviderName,
 }
 
+/// One `TokenManager` per provider per data directory, for the process's
+/// life: refreshes serialize within a provider, and a provider's on-behalf-of
+/// delegated tokens live in memory. [`TokenManager::evict_all_delegated`]
+/// reclaims a user's entry from every registered manager when their last
+/// session ends, so a long-lived `quack serve` cannot accumulate one entry
+/// per distinct user without bound.
+static MANAGERS: OnceLock<StdMutex<HashMap<ManagerKey, Arc<TokenManager>>>> = OnceLock::new();
+
 /// One provider's OAuth state: the config, the stored token, and the
 /// in-memory one.
 pub struct TokenManager {
@@ -602,8 +610,6 @@ impl TokenManager {
     /// Returns an error when the provider is not configured for OAuth or the
     /// manager cannot be built.
     pub fn shared(config: &Config, name: &ProviderName, oauth: &OAuthConfig) -> Result<Arc<Self>> {
-        static MANAGERS: OnceLock<StdMutex<HashMap<ManagerKey, Arc<TokenManager>>>> =
-            OnceLock::new();
         let key = ManagerKey {
             data_dir: config.data_dir().to_path_buf(),
             provider: name.clone(),
@@ -1041,6 +1047,32 @@ impl TokenManager {
         let _refreshing = self.refresh_lock.lock().await;
         *self.current.write().await = None;
         self.store.clear().await
+    }
+
+    /// Evict `user`'s on-behalf-of delegated token entry, when their last
+    /// server-side session ends. Per-user, not process-wide: other signed-in
+    /// users keep their tokens. A concurrent exchange that already took the
+    /// entry's lock finishes into an orphaned `Arc` (removed from the map),
+    /// so its result is dropped rather than reused — the session ended, so the
+    /// token should not be served again.
+    pub fn evict_delegated(&self, user: &UserId) {
+        if let Ok(mut delegated) = self.delegated.lock() {
+            delegated.remove(user);
+        }
+    }
+
+    /// Evict `user`'s delegated token from every registered manager, when
+    /// their last session ends. [`Self::evict_delegated`] per manager; a
+    /// no-op when no manager has been built (the CLI, or a server with no
+    /// on-behalf-of provider).
+    pub fn evict_all_delegated(user: &UserId) {
+        if let Some(registry) = MANAGERS.get()
+            && let Ok(managers) = registry.lock()
+        {
+            for manager in managers.values() {
+                manager.evict_delegated(user);
+            }
+        }
     }
 
     fn scopes(&self) -> Vec<Scope> {
