@@ -17,6 +17,7 @@
 //! put on the request, like the REST API; over stdio and the socket nothing
 //! is audited, like the CLI.
 
+mod caller;
 pub mod client;
 pub mod relay;
 pub mod socket;
@@ -40,7 +41,7 @@ use quack_core::classify::{
 };
 use quack_core::config::Config;
 use quack_core::engine::{Engine, WorkspaceHandle};
-use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{DocumentId, RunId, SessionId, UserId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::ChatDrafter;
 use quack_core::llm::acting::Acting;
@@ -50,9 +51,7 @@ use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::control::{
-    AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
-};
+use quack_core::storage::control::{AuditAction, Outcome, ResourceKind, WorkspaceRow};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
@@ -85,6 +84,8 @@ use quack_core::graph::query::PathQuery;
 use quack_core::storage::audit::Recorder;
 use tokio_util::sync::CancellationToken;
 
+use self::caller::{Caller, Failure, Rejected};
+
 /// What the server is served over: stdio or the workspace socket, where
 /// the client is the operating-system user and nothing is audited (like
 /// the CLI), or HTTP, where every request carries the [`McpCaller`] the
@@ -115,114 +116,6 @@ pub struct McpCaller {
     pub workspace: WorkspaceRow,
     pub session_viewer: SessionViewer,
     pub acting: Option<Acting>,
-}
-
-/// The caller of one tool call or resource read.
-#[derive(Clone)]
-enum Caller {
-    /// Stdio or the socket: nobody to audit or act for.
-    Unaudited,
-    /// HTTP: the request's own caller.
-    Audited(Box<McpCaller>),
-}
-
-impl Caller {
-    /// Write the audit rows; a failed write fails the call, so nothing
-    /// audited proceeds unlogged.
-    async fn record(
-        &self,
-        action: AuditAction,
-        resource: Option<AuditResource<'_>>,
-        outcome: Outcome,
-        detail: Option<serde_json::Value>,
-    ) -> Result<(), McpError> {
-        let Self::Audited(caller) = self else {
-            return Ok(());
-        };
-        caller
-            .recorder
-            .record(action.clone(), resource, outcome, detail)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, %action, "audit write failed");
-                internal(format!("audit write failed: {e}"))
-            })?;
-        Ok(())
-    }
-
-    /// Which sessions the caller may read: every one over stdio, and the
-    /// server user's over HTTP.
-    fn session_viewer(&self) -> SessionViewer {
-        match self {
-            Self::Unaudited => SessionViewer::All,
-            Self::Audited(caller) => caller.session_viewer.clone(),
-        }
-    }
-
-    /// The job queue a table this caller has labelled goes through; over
-    /// HTTP, the end of each run is audited too.
-    fn label_jobs(
-        &self,
-        queue: &JobQueue,
-        workspace: &WorkspaceId,
-        session: Option<SessionId>,
-    ) -> LabelJobs {
-        let jobs = LabelJobs::new(queue.clone()).workspace(workspace.clone());
-        match self {
-            Self::Unaudited => jobs,
-            Self::Audited(caller) => jobs.on_end(caller.recorder.on_classify_end(session)),
-        }
-    }
-
-    /// The server user making the call; nobody over stdio.
-    fn user_id(&self) -> Option<UserId> {
-        match self {
-            Self::Unaudited => None,
-            Self::Audited(caller) => Some(caller.recorder.user_id().clone()),
-        }
-    }
-
-    /// Whom model requests are made for (over HTTP, the request's user at
-    /// an on-behalf-of provider; over stdio, nobody).
-    fn acting(&self) -> Option<Acting> {
-        match self {
-            Self::Unaudited => None,
-            Self::Audited(caller) => caller.acting.clone(),
-        }
-    }
-
-    /// Audit the outcome of a `classify` call that started no run (a
-    /// preview, or a call refused before the run began) and give its tool
-    /// result.
-    async fn finish_label(
-        &self,
-        action: AuditAction,
-        detail: serde_json::Value,
-        done: Result<serde_json::Value, CoreError>,
-    ) -> Result<CallToolResult, McpError> {
-        let outcome = done
-            .as_ref()
-            .map_or_else(Outcome::of_failure, |_| Outcome::Allowed);
-        self.record(action, None, outcome, Some(detail)).await?;
-        Ok(match done {
-            Ok(body) => CallToolResult::structured(body),
-            Err(e) => failure(e.to_string()),
-        })
-    }
-
-    /// The tool result when `error` kept a model from being built, recorded
-    /// as denied when the workspace's provider allow-list refused it and as
-    /// an error otherwise.
-    async fn unbuilt(
-        &self,
-        action: AuditAction,
-        detail: serde_json::Value,
-        error: &CoreError,
-    ) -> Result<CallToolResult, McpError> {
-        self.record(action, None, Outcome::of_failure(error), Some(detail))
-            .await?;
-        Ok(failure(error.to_string()))
-    }
 }
 
 /// What an MCP server serves: the configuration, the workspace and its
@@ -653,7 +546,7 @@ enum TurnFailed {
     NotRun(String),
 }
 
-impl TurnFailed {
+impl Failure for TurnFailed {
     /// How the audit log records it.
     fn outcome(&self) -> Outcome {
         match self {
@@ -976,22 +869,43 @@ impl McpServer {
         cancel: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
-        if question.is_empty() {
-            return Ok(failure("question must not be empty"));
-        }
-        let mode = match args.mode.as_deref().map(str::trim) {
-            None | Some("") => None,
-            Some(text) => match text.parse::<ChatMode>() {
-                Ok(mode) => Some(mode),
-                Err(e) => return Ok(failure(e.to_string())),
-            },
+        // A call refused before the turn is recorded as such; the turn's own
+        // row follows from its result.
+        let asked = serde_json::json!({ "prompt": question, "documents": args.document_ids });
+        let checked = caller
+            .guarded(AuditAction::Query, asked.clone(), async {
+                if question.is_empty() {
+                    return Err(Rejected::invalid("question must not be empty"));
+                }
+                match args.mode.as_deref().map(str::trim) {
+                    None | Some("") => Ok(None),
+                    Some(text) => text
+                        .parse::<ChatMode>()
+                        .map(Some)
+                        .map_err(|e| Rejected::invalid(e.to_string())),
+                }
+            })
+            .await?;
+        let mode = match checked {
+            Ok(mode) => mode,
+            Err(rejected) => return Ok(failure(rejected.message)),
         };
-        let (session_id, created) =
-            match self.resolve_session(caller, args.session_id, mode).await? {
-                TurnSession::Existing(id) => (id, false),
-                TurnSession::Created(id) => (id, true),
-                TurnSession::NotFound => return Ok(failure("that session does not exist")),
-            };
+        let resolved = caller
+            .guarded(
+                AuditAction::Query,
+                asked.clone(),
+                self.resolve_session(caller, args.session_id, mode),
+            )
+            .await??;
+        let (session_id, created) = match resolved {
+            TurnSession::Existing(id) => (id, false),
+            TurnSession::Created(id) => (id, true),
+            TurnSession::NotFound => {
+                let missing = Rejected::invalid("that session does not exist");
+                caller.refused(AuditAction::Query, asked, &missing).await?;
+                return Ok(failure(missing.message));
+            }
+        };
         let user = caller.user_id();
         requester.progress.at(0.0, None, TURN_STARTING).await;
         let outcome = self
@@ -1010,16 +924,16 @@ impl McpServer {
             "session_id": session_id,
             "documents": args.document_ids,
         });
+        let outcome = caller
+            .audited(
+                AuditAction::Query,
+                Some(ResourceKind::Session.id(&session_id)),
+                detail,
+                async { outcome },
+            )
+            .await?;
         match outcome {
             Ok(response) => {
-                caller
-                    .record(
-                        AuditAction::Query,
-                        Some(ResourceKind::Session.id(&session_id)),
-                        Outcome::Allowed,
-                        Some(detail),
-                    )
-                    .await?;
                 let mut text = response.content.clone();
                 if !response.citations.is_empty() {
                     let sources = format!("\n\n{}\n", Sources(&response.citations));
@@ -1040,14 +954,6 @@ impl McpServer {
                 Ok(result)
             }
             Err(e) => {
-                caller
-                    .record(
-                        AuditAction::Query,
-                        Some(ResourceKind::Session.id(&session_id)),
-                        e.outcome(),
-                        Some(detail),
-                    )
-                    .await?;
                 // A turn that never recorded a message leaves no session
                 // behind; the next call starts afresh.
                 if created {
@@ -1219,31 +1125,22 @@ impl McpServer {
                 Err(e) => return Ok(failure(e.to_string())),
             };
         let detail = serde_json::json!({ "q": search.query, "search": search.describe() });
-        let model = match Embeddings::from_config(config).await {
-            Ok(model) => model,
-            Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
-        };
-        let rerank = match Rerank::from_config(config).await {
-            Ok(rerank) => rerank,
-            Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
-        };
-        // Run the search, audit its outcome, then answer — the way the `sql`
-        // tool does, so a post-authorization failure is recorded instead of
-        // dropped, while tool failures stay normal tool results.
-        let result = search
-            .run(
-                &self.inner.reader,
-                model.as_ref(),
-                rerank.as_ref(),
-                config.retrieval.rrf_k,
-            )
-            .await;
-        let outcome = match &result {
-            Ok(_) => Outcome::Allowed,
-            Err(e) => Outcome::of_failure(e),
-        };
-        caller
-            .record(AuditAction::Search, None, outcome, Some(detail))
+        // Build the models and run the search, then audit its outcome, so a
+        // post-authorization failure is recorded instead of dropped, while
+        // tool failures stay normal tool results.
+        let result = caller
+            .audited(AuditAction::Search, None, detail, async {
+                let model = Embeddings::from_config(config).await?;
+                let rerank = Rerank::from_config(config).await?;
+                search
+                    .run(
+                        &self.inner.reader,
+                        model.as_ref(),
+                        rerank.as_ref(),
+                        config.retrieval.rrf_k,
+                    )
+                    .await
+            })
             .await?;
         match result {
             Ok(found) => Ok(CallToolResult::structured(serde_json::json!(
@@ -1345,88 +1242,74 @@ impl McpServer {
         if statement.is_empty() {
             return Ok(failure("sql must not be empty"));
         }
-        let sql = statement.clone();
-        let kind = match self.db(move |db| db.classify_user_statement(&sql)).await {
-            Ok(kind) => kind,
-            Err(e) => return Ok(failure(e.message)),
-        };
         let detail = serde_json::json!({ "sql": statement });
-        let is_write = match kind.writes() {
-            Ok(is_write) => is_write,
-            Err(message) => return Ok(failure(message)),
-        };
-        if is_write && creates_temp_object(&statement) {
-            caller
-                .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
-                .await?;
-            return Ok(failure(TEMP_OBJECT_REFUSED));
-        }
-        let sql = statement.clone();
-        let max_rows = self.inner.config.analysis.max_query_rows;
-        let result = if is_write && !self.inner.policy.allows_unasked() {
-            // Over the socket, the holder's policy decides: the terminal
-            // session asks at its prompt; a command refuses. Over stdio
-            // and HTTP the connection simply cannot write.
-            let refused = match self.inner.policy {
-                WritePolicy::Ask => match self.ask_statement(statement.clone(), requester).await {
-                    Ok(result) => Some(result.map_err(internal)),
-                    Err(refusal) => {
-                        caller
-                            .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
-                            .await?;
-                        return Ok(failure(refusal));
-                    }
-                },
-                WritePolicy::Deny | WritePolicy::Allow(_) => None,
-            };
-            let Some(result) = refused else {
-                caller
-                    .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
-                    .await?;
-                return Ok(failure(match self.inner.transport {
-                    Transport::Socket => format!(
-                        "this statement modifies data; {} does not run writes for another \
-                         process (`quack mcp --allow-write` has no effect while it holds the \
-                         workspace): run it there, or quit it and run the statement again",
-                        self.inner.holder
-                    ),
-                    Transport::Stdio | Transport::Http => String::from(
-                        "this statement modifies data and this connection cannot write",
-                    ),
-                }));
-            };
-            self.inner.reader.observe_write().await;
-            TableProfile::after_write(&self.inner.db).await;
-            result
-        } else if is_write {
-            let result = self
-                .db(move |db| db.execute_query_capped(&sql, max_rows))
-                .await;
-            // Whatever ran might have created a temp object the check
-            // above did not catch (a leading comment, a multi-statement
-            // batch); check the writer's catalog regardless of whether
-            // the statement itself errored, since an earlier statement in
-            // a batch can have already run.
-            self.inner.reader.observe_write().await;
-            TableProfile::after_write(&self.inner.db).await;
-            result
-        } else {
-            // A read never queues behind a write: run it on the reader
-            // connection instead of the writer.
-            self.reader_db(move |db| db.execute_query_capped(&sql, max_rows))
-                .await
-        };
-        let outcome = if result.is_ok() {
-            Outcome::Allowed
-        } else {
-            Outcome::Error
-        };
-        caller
-            .record(AuditAction::Sql, None, outcome, Some(detail))
+        let ran = caller
+            .audited(AuditAction::Sql, None, detail, async {
+                let sql = statement.clone();
+                let kind = self
+                    .db(move |db| db.classify_user_statement(&sql))
+                    .await
+                    .map_err(|e| Rejected::invalid(e.message))?;
+                let is_write = kind.writes().map_err(Rejected::invalid)?;
+                if is_write && creates_temp_object(&statement) {
+                    return Err(Rejected::denied(TEMP_OBJECT_REFUSED));
+                }
+                let sql = statement.clone();
+                let max_rows = self.inner.config.analysis.max_query_rows;
+                let result = if is_write && !self.inner.policy.allows_unasked() {
+                    // Over the socket, the holder's policy decides: the terminal
+                    // session asks at its prompt; a command refuses. Over stdio
+                    // and HTTP the connection simply cannot write.
+                    let refused = match self.inner.policy {
+                        WritePolicy::Ask => {
+                            match self.ask_statement(statement.clone(), requester).await {
+                                Ok(result) => Some(result.map_err(internal)),
+                                Err(refusal) => return Err(Rejected::denied(refusal)),
+                            }
+                        }
+                        WritePolicy::Deny | WritePolicy::Allow(_) => None,
+                    };
+                    let Some(result) = refused else {
+                        return Err(Rejected::denied(match self.inner.transport {
+                            Transport::Socket => format!(
+                                "this statement modifies data; {} does not run writes for \
+                                 another process (`quack mcp --allow-write` has no effect while \
+                                 it holds the workspace): run it there, or quit it and run the \
+                                 statement again",
+                                self.inner.holder
+                            ),
+                            Transport::Stdio | Transport::Http => String::from(
+                                "this statement modifies data and this connection cannot write",
+                            ),
+                        }));
+                    };
+                    self.inner.reader.observe_write().await;
+                    TableProfile::after_write(&self.inner.db).await;
+                    result
+                } else if is_write {
+                    let result = self
+                        .db(move |db| db.execute_query_capped(&sql, max_rows))
+                        .await;
+                    // Whatever ran might have created a temp object the check
+                    // above did not catch (a leading comment, a multi-statement
+                    // batch); check the writer's catalog regardless of whether
+                    // the statement itself errored, since an earlier statement in
+                    // a batch can have already run.
+                    self.inner.reader.observe_write().await;
+                    TableProfile::after_write(&self.inner.db).await;
+                    result
+                } else {
+                    // A read never queues behind a write: run it on the reader
+                    // connection instead of the writer.
+                    self.reader_db(move |db| db.execute_query_capped(&sql, max_rows))
+                        .await
+                };
+                result.map_err(|e| Rejected::invalid(e.message))
+            })
             .await?;
-        let mut capped = match result {
+        let mut capped = match ran {
             Ok(capped) => capped,
-            Err(e) => return Ok(failure(e.message)),
+            Err(rejected) => return Ok(failure(rejected.message)),
         };
         // The model reads the text: the table `run_sql` gives the agent,
         // bounded in bytes and saying what was cut. A program reads the
@@ -1567,13 +1450,13 @@ impl McpServer {
             budget: config.decision.interactive_budget,
         };
         if preview.is_none() && !self.inner.policy.allows_unasked() {
+            let refusal = "labelling writes a table and this connection cannot write; pass preview \
+                           to see the questions and the labels without writing";
+            let refused = Rejected::denied(refusal);
             caller
-                .record(AuditAction::Classify, None, Outcome::Denied, Some(detail))
+                .refused(AuditAction::Classify, detail, &refused)
                 .await?;
-            return Ok(failure(
-                "labelling writes a table and this connection cannot write; pass preview to see \
-                 the questions and the labels without writing",
-            ));
+            return Ok(failure(refusal));
         }
         progress.step(0.0, "drafting the questions").await;
         let draft = match self.draft_for(&request, &decision).await {
@@ -1651,16 +1534,14 @@ impl McpServer {
     )]
     async fn list_tables(&self, extensions: Extensions) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        let tables = self.reader_db(WorkspaceDb::table_overview).await;
-        caller
-            .record(
+        let tables = caller
+            .audited(
                 AuditAction::List,
                 None,
-                Outcome::of(&tables),
-                Some(serde_json::json!({ "what": "tables" })),
+                serde_json::json!({ "what": "tables" }),
+                self.reader_db(WorkspaceDb::table_overview),
             )
-            .await?;
-        let tables = tables?;
+            .await??;
         let text = if tables.is_empty() {
             String::from("(no tables)")
         } else {
@@ -1686,20 +1567,22 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
         let name = args.table.trim().to_owned();
-        match self.describe(&name).await? {
-            Some(description) => {
-                caller
-                    .record(
-                        AuditAction::Open,
-                        None,
-                        Outcome::Allowed,
-                        Some(serde_json::json!({ "table": name })),
-                    )
-                    .await?;
-                Ok(CallToolResult::structured(description))
-            }
-            None => Ok(failure(format!("no table named '{name}'"))),
-        }
+        let described = caller
+            .audited(
+                AuditAction::Open,
+                None,
+                serde_json::json!({ "table": name }),
+                async {
+                    self.describe(&name).await?.ok_or_else(|| {
+                        McpError::invalid_params(format!("no table named '{name}'"), None)
+                    })
+                },
+            )
+            .await?;
+        Ok(match described {
+            Ok(description) => CallToolResult::structured(description),
+            Err(missing) => failure(missing.message),
+        })
     }
 
     #[tool(
@@ -1728,21 +1611,26 @@ impl McpServer {
         };
         let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
-        let model = match Embeddings::from_config(&self.inner.config).await {
+        let built = caller
+            .guarded(
+                AuditAction::Graph,
+                detail.clone(),
+                Embeddings::from_config(&self.inner.config),
+            )
+            .await?;
+        let model = match built {
             Ok(model) => model,
-            Err(e) => return caller.unbuilt(AuditAction::Graph, detail, &e).await,
+            Err(e) => return Ok(failure(e.to_string())),
         };
         // Run, audit the outcome, then answer, the way `sql` does, so a
         // failure after authorization is recorded rather than dropped.
-        let result = async {
-            let embedding = query.embedding(model.as_ref()).await.map_err(internal)?;
-            // An unknown class or relation id names the real ones.
-            self.reader_db(move |db| query.run(db, embedding.as_ref(), &options))
-                .await
-        }
-        .await;
-        caller
-            .record(AuditAction::Graph, None, Outcome::of(&result), Some(detail))
+        let result = caller
+            .audited(AuditAction::Graph, None, detail, async {
+                let embedding = query.embedding(model.as_ref()).await.map_err(internal)?;
+                // An unknown class or relation id names the real ones.
+                self.reader_db(move |db| query.run(db, embedding.as_ref(), &options))
+                    .await
+            })
             .await?;
         let result = match result {
             Ok(result) => result,
@@ -1776,20 +1664,25 @@ impl McpServer {
         let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let PathQuery { from, to, max_hops } = query.clone();
-        let model = match Embeddings::from_config(&self.inner.config).await {
+        let built = caller
+            .guarded(
+                AuditAction::Graph,
+                detail.clone(),
+                Embeddings::from_config(&self.inner.config),
+            )
+            .await?;
+        let model = match built {
             Ok(model) => model,
-            Err(e) => return caller.unbuilt(AuditAction::Graph, detail, &e).await,
+            Err(e) => return Ok(failure(e.to_string())),
         };
         // Run, audit the outcome, then answer (see `search_graph`).
-        let result = async {
-            let ends = query.embeddings(model.as_ref()).await.map_err(internal)?;
-            // An end that names no entity comes back with the closest labels.
-            self.reader_db(move |db| query.run(db, &ends, &options))
-                .await
-        }
-        .await;
-        caller
-            .record(AuditAction::Graph, None, Outcome::of(&result), Some(detail))
+        let result = caller
+            .audited(AuditAction::Graph, None, detail, async {
+                let ends = query.embeddings(model.as_ref()).await.map_err(internal)?;
+                // An end that names no entity comes back with the closest labels.
+                self.reader_db(move |db| query.run(db, &ends, &options))
+                    .await
+            })
             .await?;
         let result = match result {
             Ok(result) => result,
@@ -1819,16 +1712,14 @@ impl McpServer {
             after: args.after.map(DocumentId::from),
             ..DocumentListing::first(args.limit.unwrap_or(DocumentListing::PAGE))
         };
-        let documents = self.reader_db(move |db| db.documents(&listing)).await;
-        caller
-            .record(
+        let page = caller
+            .audited(
                 AuditAction::List,
                 None,
-                Outcome::of(&documents),
-                Some(serde_json::json!({ "what": "documents" })),
+                serde_json::json!({ "what": "documents" }),
+                self.reader_db(move |db| db.documents(&listing)),
             )
-            .await?;
-        let page = documents?;
+            .await??;
         Ok(CallToolResult::structured(
             serde_json::to_value(&page).map_err(internal)?,
         ))
@@ -2069,17 +1960,19 @@ impl ServerHandler for McpServer {
         // The access log takes the resource's template, the workspace's own
         // audit detail the full URI: a table name is workspace content.
         let audit_id = parsed.map(WorkspaceResource::audit_id);
-        caller
-            .record(
+        let not_found = || McpError::resource_not_found(format!("no resource at {uri}"), None);
+        let (resource, text) = caller
+            .audited(
                 AuditAction::Open,
                 audit_id.as_deref().map(|id| ResourceKind::Resource.id(id)),
-                Outcome::Allowed,
-                Some(serde_json::json!({ "uri": uri })),
+                serde_json::json!({ "uri": uri }),
+                async {
+                    let resource = parsed.filter(|r| self.offers(*r)).ok_or_else(not_found)?;
+                    let text = self.resource_text(resource).await?.ok_or_else(not_found)?;
+                    Ok((resource, text))
+                },
             )
-            .await?;
-        let not_found = || McpError::resource_not_found(format!("no resource at {uri}"), None);
-        let resource = parsed.filter(|r| self.offers(*r)).ok_or_else(not_found)?;
-        let text = self.resource_text(resource).await?.ok_or_else(not_found)?;
+            .await??;
         let mime = resource.mime_type();
         Ok(
             ReadResourceResult::new(vec![ResourceContents::TextResourceContents {

@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use super::{Page, Tab, WebResult, WebUser, html};
 use crate::api::query::SearchQuery;
-use crate::auth::{Access, Need};
+use crate::auth::{Access, Audit, Need};
 use crate::state::App;
 
 /// Documents a picker offers at most, newest first; the rest are reached
@@ -161,7 +161,11 @@ pub(super) async fn search_page(
     Path(id): Path<WorkspaceId>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "search").await?;
+    access
+        .audited(&app, Audit::read(AuditAction::Page, "search"), async {
+            Ok(())
+        })
+        .await?;
     render(&app, &access, SearchForm::default(), None).await
 }
 

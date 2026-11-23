@@ -18,12 +18,12 @@ use axum::response::{IntoResponse, Response};
 use quack_core::error::Result as CoreResult;
 use quack_core::ids::WorkspaceId;
 use quack_core::okf::{self, TarSink};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use quack_core::storage::workspace::WorkspaceDb;
 use tokio::sync::mpsc;
 
-use crate::auth::{Access, Identity, Need};
-use crate::error::ApiResult;
+use crate::auth::{Access, Audit, Identity, Need};
+use crate::error::{ApiError, ApiResult};
 use crate::state::App;
 
 /// Bytes gathered before one is sent to the body.
@@ -95,28 +95,24 @@ impl Download {
                 .await;
             // The export's own sender is gone with its closure; this one
             // carries a failure to the body, then closes it.
-            let (outcome, detail) = match written {
-                Ok(detail) => (Outcome::Allowed, detail),
+            let (work, detail) = match written {
+                Ok(detail) => (Ok(()), detail),
                 Err(e) => {
                     tracing::warn!(workspace = %id, format, error = %e, "export failed partway");
                     drop(failed.send(Err(io::Error::other(e.to_string()))).await);
-                    (
-                        Outcome::Error,
-                        serde_json::json!({ "format": format, "error": e.to_string() }),
-                    )
+                    let detail = serde_json::json!({ "format": format, "error": e.to_string() });
+                    (Err(ApiError::from(e)), detail)
                 }
             };
+            let exported = work.is_ok();
             drop(failed);
-            let recorded = access
-                .audit(
-                    &audit_app,
-                    AuditAction::Export,
-                    Some(ResourceKind::Workspace.id(id.as_str())),
-                    outcome,
-                    Some(detail),
-                )
-                .await;
-            if let Err(e) = recorded {
+            let audit = Audit::of(AuditAction::Export)
+                .resource(ResourceKind::Workspace, id.as_str())
+                .detail(detail);
+            let recorded = access.audited(&audit_app, audit, async { work }).await;
+            if let Err(e) = recorded
+                && exported
+            {
                 tracing::error!(workspace = %id, format, error = %e.message, "could not audit an export");
             }
         });

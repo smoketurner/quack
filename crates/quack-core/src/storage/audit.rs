@@ -322,6 +322,10 @@ impl Recorder {
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> Result<AuditId> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the one place a recorded outcome becomes an entry"
+        )]
         let mut entry = self.entry(action, outcome);
         if let Some(resource) = resource {
             entry = entry.on(resource);
@@ -380,10 +384,14 @@ impl Recorder {
                     "session_id": session,
                 });
                 let resource = ResourceKind::ClassificationRun.id(&run.id);
-                if let Err(e) = recorder
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the outcome is the labelling run's own end, not a caller's choice"
+                )]
+                let recorded = recorder
                     .record(AuditAction::Classify, Some(resource), outcome, Some(detail))
-                    .await
-                {
+                    .await;
+                if let Err(e) = recorded {
                     tracing::error!(error = %e, "audit write failed");
                 }
             }
@@ -406,14 +414,18 @@ impl Recorder {
             detail,
             ..
         } = &row;
-        Self::record(
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the outcome is the background run's own start or end"
+        )]
+        let recorded = Self::record(
             self,
             action.clone(),
             Some(resource),
             *outcome,
             Some(detail.clone()),
         )
-        .await
-        .map(drop)
+        .await;
+        recorded.map(drop)
     }
 }

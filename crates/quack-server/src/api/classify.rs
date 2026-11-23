@@ -18,13 +18,13 @@ use quack_core::jobs::JobId;
 use quack_core::llm::ChatDrafter;
 use quack_core::llm::decision::DecisionModel;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::storage::control::AuditAction;
 use quack_core::storage::writer::Writer;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
-use crate::error::{ApiError, ApiResult};
+use crate::auth::{Access, Audit, Identity, Need};
+use crate::error::ApiResult;
 use crate::run::{self, RunKind};
 use crate::state::App;
 
@@ -109,41 +109,23 @@ pub(crate) async fn runs(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<classify::Runs>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "classifications")
+    let runs = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "classifications"),
+            app.read(&id, |db| classify::Run::list(db, LISTED_RUNS)),
+        )
         .await?;
-    Ok(Json(
-        app.read(&id, |db| classify::Run::list(db, LISTED_RUNS))
-            .await?,
-    ))
+    Ok(Json(runs))
 }
 
 impl Access {
     /// The decision model for this workspace, or why not: a provider the
-    /// allow-list refuses is 403, and either way the attempt is audited.
-    async fn decision_model(&self, app: &App) -> ApiResult<DecisionModel> {
-        let built = DecisionModel::from_config(&app.engine.config)
+    /// allow-list refuses is 403.
+    async fn decision_model(&self, app: &App) -> Result<DecisionModel, CoreError> {
+        DecisionModel::from_config(&app.engine.config)
             .await
-            .and_then(|model| model.ok_or(CoreError::NoDecisionModel));
-        self.model(app, AuditAction::Classify, built).await
-    }
-
-    /// Audit a refused or failed labelling and give the API's error for it.
-    async fn classify_failed(&self, app: &App, error: CoreError) -> ApiError {
-        let detail = serde_json::json!({ "error": error.to_string() });
-        match self
-            .audit(
-                app,
-                AuditAction::Classify,
-                None,
-                Outcome::of_failure(&error),
-                Some(detail),
-            )
-            .await
-        {
-            Ok(_) => ApiError::from(error),
-            Err(audit_failed) => audit_failed,
-        }
+            .and_then(|model| model.ok_or(CoreError::NoDecisionModel))
     }
 
     /// The draft a request names: the `set` sent back, checked; else the
@@ -177,34 +159,25 @@ impl Access {
         table: &str,
         sentence: Option<&str>,
     ) -> ApiResult<Draft> {
-        let decision = self.decision_model(app).await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let request = classify::Request {
-            table: table.to_owned(),
-            sentence: sentence.map(str::to_owned),
-            set: None,
-            rows: Rows::Missing,
-        };
-        match self.draft_of(app, &db, &decision, &request).await {
-            Ok(draft) => {
-                let detail = serde_json::json!({
-                    "draft": true,
-                    "table": draft.table,
-                    "origin": draft.origin,
-                    "sentence": draft.set.sentence,
-                });
-                self.audit(
-                    app,
-                    AuditAction::Classify,
-                    None,
-                    Outcome::Allowed,
-                    Some(detail),
-                )
-                .await?;
-                Ok(draft)
-            }
-            Err(error) => Err(self.classify_failed(app, error).await),
-        }
+        self.audited_with(app, Audit::of(AuditAction::Classify), async |audit| {
+            let decision = self.decision_model(app).await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let request = classify::Request {
+                table: table.to_owned(),
+                sentence: sentence.map(str::to_owned),
+                set: None,
+                rows: Rows::Missing,
+            };
+            let draft = self.draft_of(app, &db, &decision, &request).await?;
+            audit.set_detail(serde_json::json!({
+                "draft": true,
+                "table": draft.table,
+                "origin": draft.origin,
+                "sentence": draft.set.sentence,
+            }));
+            Ok(draft)
+        })
+        .await
     }
 
     /// Label the first rows of a request and hand back the questions and
@@ -216,12 +189,12 @@ impl Access {
         request: &classify::Request,
         rows: u32,
     ) -> ApiResult<classify::Report> {
-        let decision = self.decision_model(app).await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let waiting = Waiting::Caller {
-            budget: app.engine.config.decision.interactive_budget,
-        };
-        let report = async {
+        self.audited_with(app, Audit::of(AuditAction::Classify), async |audit| {
+            let decision = self.decision_model(app).await?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let waiting = Waiting::Caller {
+                budget: app.engine.config.decision.interactive_budget,
+            };
             let draft = self.draft_of(app, &db, &decision, request).await?;
             let preview = draft
                 .preview(
@@ -237,34 +210,20 @@ impl Access {
                 .outline(&db, &decision, request.rows)
                 .await?
                 .estimated_from(&preview);
-            Ok::<_, CoreError>(classify::Report {
+            audit.set_detail(serde_json::json!({
+                "preview": rows,
+                "table": draft.table,
+                "origin": draft.origin,
+                "sentence": draft.set.sentence,
+            }));
+            Ok(classify::Report {
                 draft,
                 outline,
                 preview: Some(preview),
                 run: None,
             })
-        }
-        .await;
-        match report {
-            Ok(report) => {
-                let detail = serde_json::json!({
-                    "preview": rows,
-                    "table": report.draft.table,
-                    "origin": report.draft.origin,
-                    "sentence": report.draft.set.sentence,
-                });
-                self.audit(
-                    app,
-                    AuditAction::Classify,
-                    None,
-                    Outcome::Allowed,
-                    Some(detail),
-                )
-                .await?;
-                Ok(report)
-            }
-            Err(error) => Err(self.classify_failed(app, error).await),
-        }
+        })
+        .await
     }
 
     /// Start labelling a request's rows as a background job, from the API
@@ -276,30 +235,30 @@ impl Access {
         app: &App,
         request: classify::Request,
     ) -> ApiResult<Started> {
-        let decision = self.decision_model(app).await?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let planned = async {
-            let draft = self.draft_of(app, &db, &decision, &request).await?;
-            let outline = draft.outline(&db, &decision, request.rows).await?;
-            Ok::<_, CoreError>((draft, outline))
-        }
-        .await;
-        let (draft, outline) = match planned {
-            Ok(planned) => planned,
-            Err(error) => return Err(self.classify_failed(app, error).await),
-        };
-        let run = run::start(
-            app,
-            self,
-            RunKind::CLASSIFY,
-            serde_json::json!({
-                "outline": outline,
-                "model": decision.label(),
-                "origin": draft.origin,
-                "sentence": draft.set.sentence,
-            }),
-        )
-        .await?;
+        // The run audits its own start and end, so this audits only a
+        // request that is refused before one starts.
+        let (decision, db, draft, outline, run) = self
+            .audited_with(app, Audit::of(AuditAction::Classify), async |audit| {
+                let decision = self.decision_model(app).await?;
+                let db = app.workspace(&self.membership.workspace.id).await?.writer;
+                let draft = self.draft_of(app, &db, &decision, &request).await?;
+                let outline = draft.outline(&db, &decision, request.rows).await?;
+                let run = run::start(
+                    app,
+                    self,
+                    RunKind::CLASSIFY,
+                    serde_json::json!({
+                        "outline": outline,
+                        "model": decision.label(),
+                        "origin": draft.origin,
+                        "sentence": draft.set.sentence,
+                    }),
+                )
+                .await?;
+                audit.already_recorded();
+                Ok((decision, db, draft, outline, run))
+            })
+            .await?;
         let run_id = run.id().clone();
         let started = run_id.clone();
         let started_by = self.identity.user_id.to_string();

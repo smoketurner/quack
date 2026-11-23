@@ -13,11 +13,11 @@ use quack_core::ontology::OntologyDiff;
 use quack_core::ontology::candidates::{AutoAcceptance, CandidateAction, CandidateRow, Queue};
 use quack_core::ontology::induction::{Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::VersionRow;
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::run::{self, RunKind};
 use crate::state::{App, with_db};
@@ -43,11 +43,12 @@ pub(crate) async fn show(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<Ontology>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "ontology")
+    let ontology = access
+        .audited(&app, Audit::read(AuditAction::List, "ontology"), async {
+            let current = app.read(&id, store::current).await?;
+            current.ok_or_else(|| ApiError::not_found("no ontology yet"))
+        })
         .await?;
-    let current = app.read(&id, store::current).await?;
-    let ontology = current.ok_or_else(|| ApiError::not_found("no ontology yet"))?;
     Ok(Json(ontology))
 }
 
@@ -65,10 +66,14 @@ pub(crate) async fn schema(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::Show, "ontology_schema")
+    let schema = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::Show, "ontology_schema"),
+            async { Ok(serde_json::to_value(Ontology::json_schema())?) },
+        )
         .await?;
-    Ok(Json(serde_json::to_value(Ontology::json_schema())?))
+    Ok(Json(schema))
 }
 
 /// Validate the body and store it as the next version.
@@ -122,79 +127,72 @@ impl Access {
         json: &str,
         note: &'static str,
     ) -> ApiResult<Ontology> {
-        let ontology = Ontology::from_json(json)?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let stored = with_db(db, move |db| {
-            store::save(db, &ontology, Revision::reviewed(Some(&author), Some(note)))
+        self.audited_with(app, Audit::of(AuditAction::Ontology), async |audit| {
+            let ontology = Ontology::from_json(json)?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let stored = with_db(db, move |db| {
+                store::save(db, &ontology, Revision::reviewed(Some(&author), Some(note)))
+            })
+            .await?;
+            audit.names_version(&stored)?;
+            audit.set_detail(
+                serde_json::json!({ "version": stored.version, "classes": stored.classes.len() }),
+            );
+            Ok(stored)
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
-        )
-        .await?;
-        Ok(stored)
+        .await
     }
 
     /// Apply one form edit to the current ontology and store the result as
     /// the next version; the save validates it as it does any other.
     pub(crate) async fn edit_ontology(&self, app: &App, edit: Edit) -> ApiResult<Ontology> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let note = format!("{edit} in the web UI");
-        let detail = serde_json::to_value(&edit)?;
-        let stored = with_db(db, move |db| {
-            let mut ontology = store::current(db)?
-                .ok_or_else(|| CoreError::Ontology(String::from("no ontology yet")))?;
-            edit.apply(&mut ontology)?;
-            store::save(
-                db,
-                &ontology,
-                Revision::reviewed(Some(&author), Some(&note)),
-            )
+        self.audited_with(app, Audit::of(AuditAction::Ontology), async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let note = format!("{edit} in the web UI");
+            let detail = serde_json::to_value(&edit)?;
+            audit.set_detail(serde_json::json!({ "edited": detail }));
+            let stored = with_db(db, move |db| {
+                let mut ontology = store::current(db)?
+                    .ok_or_else(|| CoreError::Ontology(String::from("no ontology yet")))?;
+                edit.apply(&mut ontology)?;
+                store::save(
+                    db,
+                    &ontology,
+                    Revision::reviewed(Some(&author), Some(&note)),
+                )
+            })
+            .await?;
+            audit.names_version(&stored)?;
+            audit.set_detail(serde_json::json!({ "edited": detail, "version": stored.version }));
+            Ok(stored)
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "edited": detail, "version": stored.version })),
-        )
-        .await?;
-        Ok(stored)
+        .await
     }
 
     /// Install the built-in ontology as version 1; 409 once one exists.
     pub(crate) async fn init_ontology(&self, app: &App) -> ApiResult<Ontology> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let stored = with_db(db, move |db| {
-            if store::latest_version(db)?.is_some() {
-                return Ok(None);
-            }
-            store::save(
-                db,
-                &Ontology::builtin_default(),
-                Revision::reviewed(Some(&author), Some("built-in default")),
-            )
-            .map(Some)
+        self.audited_with(app, Audit::of(AuditAction::Ontology), async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let stored = with_db(db, move |db| {
+                if store::latest_version(db)?.is_some() {
+                    return Ok(None);
+                }
+                store::save(
+                    db,
+                    &Ontology::builtin_default(),
+                    Revision::reviewed(Some(&author), Some("built-in default")),
+                )
+                .map(Some)
+            })
+            .await?
+            .ok_or_else(|| ApiError::conflict("an ontology already exists"))?;
+            audit.names_version(&stored)?;
+            Ok(stored)
         })
-        .await?
-        .ok_or_else(|| ApiError::conflict("an ontology already exists"))?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-        Ok(stored)
+        .await
     }
 
     /// Rename a class or relation id as the next version, moving the
@@ -204,19 +202,18 @@ impl Access {
         app: &App,
         rename: &RenameRequest,
     ) -> ApiResult<Ontology> {
-        let renames = IdRenames::one(rename.kind, &rename.from, &rename.to)?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let stored = with_db(db, move |db| store::rename(db, &renames, Some(&author))).await?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "renamed": rename, "version": stored.version })),
-        )
-        .await?;
-        Ok(stored)
+        let audit =
+            Audit::of(AuditAction::Ontology).detail(serde_json::json!({ "renamed": rename }));
+        self.audited_with(app, audit, async |audit| {
+            let renames = IdRenames::one(rename.kind, &rename.from, &rename.to)?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let stored = with_db(db, move |db| store::rename(db, &renames, Some(&author))).await?;
+            audit.names_version(&stored)?;
+            audit.set_detail(serde_json::json!({ "renamed": rename, "version": stored.version }));
+            Ok(stored)
+        })
+        .await
     }
 
     /// Store version `version` again as the newest.
@@ -225,18 +222,28 @@ impl Access {
         app: &App,
         version: OntologyVersion,
     ) -> ApiResult<Ontology> {
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let stored = with_db(db, move |db| store::restore(db, version, Some(&author))).await?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "restored": version, "version": stored.version })),
-        )
-        .await?;
-        Ok(stored)
+        let audit =
+            Audit::of(AuditAction::Ontology).detail(serde_json::json!({ "restored": version }));
+        self.audited_with(app, audit, async |audit| {
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let stored = with_db(db, move |db| store::restore(db, version, Some(&author))).await?;
+            audit.names_version(&stored)?;
+            audit.set_detail(serde_json::json!({ "restored": version, "version": stored.version }));
+            Ok(stored)
+        })
+        .await
+    }
+}
+
+impl Audit {
+    /// Name the ontology version a save stored as the row's resource.
+    fn names_version(&mut self, stored: &Ontology) -> ApiResult<()> {
+        self.set_resource(
+            ResourceKind::OntologyVersion,
+            stored.saved_version()?.to_string(),
+        );
+        Ok(())
     }
 }
 
@@ -273,11 +280,14 @@ pub(crate) async fn versions(
     Query(q): Query<VersionsQuery>,
 ) -> ApiResult<Json<VersionList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "ontology_versions")
-        .await?;
     let limit = q.limit;
-    let rows = app.read(&id, move |db| store::versions(db, limit)).await?;
+    let rows = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "ontology_versions"),
+            app.read(&id, move |db| store::versions(db, limit)),
+        )
+        .await?;
     Ok(Json(VersionList { versions: rows }))
 }
 
@@ -310,32 +320,29 @@ pub(crate) async fn version(
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<VersionDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit(
-            &app,
-            AuditAction::Open,
-            Some(ResourceKind::OntologyVersion.id(&v.to_string())),
-            Outcome::Allowed,
-            None,
-        )
-        .await?;
-    let against = q.against.or_else(|| v.previous());
-    let (snapshot, older) = app
-        .read(&id, move |db| {
-            let snapshot = store::version(db, v)?;
-            let older = match against {
-                Some(against) => store::version(db, against)?,
-                None => None,
-            };
-            Ok((snapshot, older))
+    let audit = Audit::of(AuditAction::Open).resource(ResourceKind::OntologyVersion, v.to_string());
+    let detail = access
+        .audited(&app, audit, async {
+            let against = q.against.or_else(|| v.previous());
+            let (snapshot, older) = app
+                .read(&id, move |db| {
+                    let snapshot = store::version(db, v)?;
+                    let older = match against {
+                        Some(against) => store::version(db, against)?,
+                        None => None,
+                    };
+                    Ok((snapshot, older))
+                })
+                .await?;
+            let snapshot = snapshot.ok_or_else(|| ApiError::not_found("no such version"))?;
+            let diff = older.map(|older| snapshot.diff(&older));
+            Ok(VersionDetail {
+                ontology: snapshot,
+                diff,
+            })
         })
         .await?;
-    let snapshot = snapshot.ok_or_else(|| ApiError::not_found("no such version"))?;
-    let diff = older.map(|older| snapshot.diff(&older));
-    Ok(Json(VersionDetail {
-        ontology: snapshot,
-        diff,
-    }))
+    Ok(Json(detail))
 }
 
 /// Save an older version again as the newest.
@@ -488,44 +495,44 @@ impl Access {
         app: &App,
         auto_accept: bool,
     ) -> ApiResult<TableProposal> {
-        let options = app.engine.config.ontology.table_evidence();
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let proposed = with_db(db, move |db| {
-            let current = store::current(db)?;
-            let proposals = propose_from_tables(db, current.as_ref(), &options)?;
-            if proposals.is_empty() {
-                return Ok(TableProposal {
-                    candidates: 0,
-                    run: None,
-                    version: None,
-                });
-            }
-            let run = candidates::store_run(db, &proposals)?;
-            let version = if auto_accept {
-                match candidates::accept_run(db, &run, Some(&author))? {
-                    AutoAcceptance::Accepted(stored) => stored.ontology.version,
-                    AutoAcceptance::KeptAside { .. } => None,
+        let audit = Audit::of(AuditAction::Propose);
+        self.audited_with(app, audit, async |audit| {
+            let options = app.engine.config.ontology.table_evidence();
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let proposed = with_db(db, move |db| {
+                let current = store::current(db)?;
+                let proposals = propose_from_tables(db, current.as_ref(), &options)?;
+                if proposals.is_empty() {
+                    return Ok(TableProposal {
+                        candidates: 0,
+                        run: None,
+                        version: None,
+                    });
                 }
-            } else {
-                None
-            };
-            Ok(TableProposal {
-                candidates: proposals.len(),
-                run: Some(run),
-                version,
+                let run = candidates::store_run(db, &proposals)?;
+                let version = if auto_accept {
+                    match candidates::accept_run(db, &run, Some(&author))? {
+                        AutoAcceptance::Accepted(stored) => stored.ontology.version,
+                        AutoAcceptance::KeptAside { .. } => None,
+                    }
+                } else {
+                    None
+                };
+                Ok(TableProposal {
+                    candidates: proposals.len(),
+                    run: Some(run),
+                    version,
+                })
             })
+            .await?;
+            if let Some(run) = &proposed.run {
+                audit.set_resource(ResourceKind::InductionRun, run.to_string());
+            }
+            audit.set_detail(serde_json::json!({ "candidates": proposed.candidates, "auto_accept": auto_accept, "version": proposed.version }));
+            Ok(proposed)
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Propose,
-            proposed.run.as_ref().map(|r| ResourceKind::InductionRun.id(r)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "candidates": proposed.candidates, "auto_accept": auto_accept, "version": proposed.version })),
-        )
-        .await?;
-        Ok(proposed)
+        .await
     }
 
     /// Accept (as proposed or amended) or reject one candidate.
@@ -536,32 +543,32 @@ impl Access {
         action: CandidateAction,
         target: Option<&str>,
     ) -> ApiResult<CandidateDecided> {
-        let decision = action.decision(target)?;
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let candidate_id = candidate.to_owned();
-        let version = with_db(db, move |db| {
-            if let Some(decision) = decision {
-                let stored = candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
-                return Ok(stored.version);
-            }
-            candidates::reject(db, &[candidate_id], Some(&author))?;
-            Ok(None)
+        let audit = Audit::of(AuditAction::Ontology)
+            .resource(ResourceKind::Candidate, candidate)
+            .detail(serde_json::json!({ "action": action }));
+        self.audited_with(app, audit, async |audit| {
+            let decision = action.decision(target)?;
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let candidate_id = candidate.to_owned();
+            let version = with_db(db, move |db| {
+                if let Some(decision) = decision {
+                    let stored =
+                        candidates::accept(db, &[(candidate_id, decision)], Some(&author))?;
+                    return Ok(stored.version);
+                }
+                candidates::reject(db, &[candidate_id], Some(&author))?;
+                Ok(None)
+            })
+            .await?;
+            audit.set_detail(serde_json::json!({ "action": action, "version": version }));
+            Ok(CandidateDecided {
+                candidate: candidate.to_owned(),
+                action,
+                version,
+            })
         })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            Some(ResourceKind::Candidate.id(candidate)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "action": action, "version": version })),
-        )
-        .await?;
-        Ok(CandidateDecided {
-            candidate: candidate.to_owned(),
-            action,
-            version,
-        })
+        .await
     }
 
     /// Accept and reject candidates in bulk: one new version for every
@@ -572,40 +579,38 @@ impl Access {
         accept: Vec<String>,
         reject: Vec<String>,
     ) -> ApiResult<CandidatesDecided> {
-        if accept.is_empty() && reject.is_empty() {
-            return Err(ApiError::bad_request(
-                "choose at least one candidate to accept or reject",
-            ));
-        }
-        let db = app.workspace(&self.membership.workspace.id).await?.writer;
-        let author = self.identity.username.clone();
-        let (accepting, rejecting) = (accept.clone(), reject.clone());
-        let (version, rejected) = with_db(db, move |db| {
-            let decisions: Vec<(String, Decision)> = accepting
-                .into_iter()
-                .map(|id| (id, Decision::Accept))
-                .collect();
-            let review = candidates::decide(db, &decisions, &rejecting, Some(&author))?;
-            Ok((review.version.and_then(|o| o.version), review.rejected))
-        })
-        .await?;
-        self.audit(
-            app,
-            AuditAction::Ontology,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({
+        let audit = Audit::of(AuditAction::Ontology)
+            .detail(serde_json::json!({ "accepted": accept, "rejected": reject }));
+        self.audited_with(app, audit, async |audit| {
+            if accept.is_empty() && reject.is_empty() {
+                return Err(ApiError::bad_request(
+                    "choose at least one candidate to accept or reject",
+                ));
+            }
+            let db = app.workspace(&self.membership.workspace.id).await?.writer;
+            let author = self.identity.username.clone();
+            let (accepting, rejecting) = (accept.clone(), reject.clone());
+            let (version, rejected) = with_db(db, move |db| {
+                let decisions: Vec<(String, Decision)> = accepting
+                    .into_iter()
+                    .map(|id| (id, Decision::Accept))
+                    .collect();
+                let review = candidates::decide(db, &decisions, &rejecting, Some(&author))?;
+                Ok((review.version.and_then(|o| o.version), review.rejected))
+            })
+            .await?;
+            audit.set_detail(serde_json::json!({
                 "accepted": accept,
                 "rejected": reject,
                 "version": version,
-            })),
-        )
-        .await?;
-        Ok(CandidatesDecided {
-            accepted: accept.len(),
-            rejected,
-            version,
+            }));
+            Ok(CandidatesDecided {
+                accepted: accept.len(),
+                rejected,
+                version,
+            })
         })
+        .await
     }
 }
 
@@ -637,12 +642,13 @@ pub(crate) async fn list_candidates(
     Query(q): Query<CandidatesQuery>,
 ) -> ApiResult<Json<CandidateList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access
-        .audit_read(&app, AuditAction::List, "ontology_candidates")
-        .await?;
     let queue = q.status;
-    let rows = app
-        .read(&id, move |db| candidates::queue(db, queue))
+    let rows = access
+        .audited(
+            &app,
+            Audit::read(AuditAction::List, "ontology_candidates"),
+            app.read(&id, move |db| candidates::queue(db, queue)),
+        )
         .await?;
     Ok(Json(CandidateList { candidates: rows }))
 }
@@ -723,26 +729,28 @@ impl Access {
         app: &App,
         sample: Option<u32>,
     ) -> ApiResult<DocumentRunStarted> {
+        self.audited_with(app, Audit::of(AuditAction::Propose), async |audit| {
+            self.document_run(app, sample, audit).await
+        })
+        .await
+    }
+
+    /// The work of [`Access::start_document_run`]; the run audits its own
+    /// start and end.
+    async fn document_run(
+        &self,
+        app: &App,
+        sample: Option<u32>,
+        audit: &mut Audit,
+    ) -> ApiResult<DocumentRunStarted> {
         let (access, id) = (self, &self.membership.workspace.id);
         let mut options = app.engine.config.ontology.document_evidence();
         if let Some(n) = sample {
             options.sample_chunks = n;
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = access
-            .model(
-                app,
-                AuditAction::Propose,
-                llm::chat_extractor(&app.engine.config).await,
-            )
-            .await?;
-        let embeddings = access
-            .model(
-                app,
-                AuditAction::Propose,
-                Embeddings::from_config(&app.engine.config).await,
-            )
-            .await?;
+        let extractor = llm::chat_extractor(&app.engine.config).await?;
+        let embeddings = Embeddings::from_config(&app.engine.config).await?;
         let (cost, chunks, current) = app
             .read(id, move |db| {
                 let cost = documents::estimate(db, &options)?;
@@ -761,6 +769,7 @@ impl Access {
             serde_json::json!({ "documents": true, "cost": cost }),
         )
         .await?;
+        audit.already_recorded();
         let run_id = run.id().clone();
         let concurrency = app.engine.config.analysis.extraction_concurrency;
         let progress_run = run_id.clone();
