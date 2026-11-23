@@ -14,9 +14,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use quack_core::analysis::agent::{AgentResponse, AgentResponseBody};
-use quack_core::analysis::events::{
-    self, AgentEvent, Decision, FailureKind, ToolName, TurnFailure,
-};
+use quack_core::analysis::events::{self, AgentEvent, Decision, ToolName, TurnFailure};
 use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchBody, SearchDetail, SearchOutcome};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
@@ -26,7 +24,7 @@ use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::storage::audit::Recorder;
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
@@ -34,12 +32,12 @@ use quack_core::storage::workspace::{
     TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use utoipa::ToSchema;
 
 use super::StreamEvent;
 use super::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
-use crate::auth::{Access, Identity, Need};
+use crate::auth::{Access, Audit, Identity, Need};
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::permissions;
 use crate::state::{App, with_db};
@@ -93,59 +91,69 @@ impl PreparedTurn {
         unasked: WritePolicy,
     ) -> ApiResult<Self> {
         let access = Access::resolve(app, identity, workspace_id, Need::READ).await?;
-        if body.allow_write && !access.permits(Need::WRITE) {
-            access
-                .audit(app, AuditAction::Query, None, Outcome::Denied, None)
+        // The turn's job records the turn once it has one; this records a
+        // request that is refused or fails before then.
+        access
+            .audited_with(app, Audit::of(AuditAction::Query), async |audit| {
+                if body.allow_write && !access.permits(Need::WRITE) {
+                    return Err(ApiError::forbidden(
+                        "allow_write needs the member role and the write scope",
+                    ));
+                }
+                if body.prompt.trim().is_empty() {
+                    return Err(ApiError::bad_request("prompt must not be empty"));
+                }
+                let chat = app.engine.config.chat_model_ref()?;
+                let model_names = (chat.provider_name.to_string(), chat.model.to_owned());
+                let mode = body.mode;
+                let db = app.workspace(workspace_id).await?.writer;
+                let reader = app.workspace(workspace_id).await?.reader;
+                let requested = body.session_id.clone();
+                let model = chat.to_string();
+                let user = access.identity.user_id.clone();
+                let viewer = access.session_viewer();
+                let session_id = with_db(Arc::clone(&db), move |db| {
+                    if let Some(id) = requested {
+                        // A session the caller may not see reads as missing, not forbidden.
+                        sessions::get_session(db, &id)?
+                            .filter(|s| s.visible_to(&viewer))
+                            .ok_or_else(|| ResourceKind::Session.missing(id.as_str()))?;
+                        // A session's mode is set when it is created; `mode` on a
+                        // later turn is ignored, and PATCH .../sessions/{sid} changes
+                        // it explicitly (issue #57).
+                        Ok(id)
+                    } else {
+                        Ok(sessions::create_session(
+                            db,
+                            &model,
+                            mode.unwrap_or_default(),
+                            Some(&user),
+                        )?
+                        .id)
+                    }
+                })
                 .await?;
-            return Err(ApiError::forbidden(
-                "allow_write needs the member role and the write scope",
-            ));
-        }
-        if body.prompt.trim().is_empty() {
-            return Err(ApiError::bad_request("prompt must not be empty"));
-        }
-        let chat = app.engine.config.chat_model_ref()?;
-        let model_names = (chat.provider_name.to_string(), chat.model.to_owned());
-        let mode = body.mode;
-        let db = app.workspace(workspace_id).await?.writer;
-        let reader = app.workspace(workspace_id).await?.reader;
-        let requested = body.session_id.clone();
-        let model = chat.to_string();
-        let user = access.identity.user_id.clone();
-        let viewer = access.session_viewer();
-        let session_id = with_db(Arc::clone(&db), move |db| {
-            if let Some(id) = requested {
-                // A session the caller may not see reads as missing, not forbidden.
-                sessions::get_session(db, &id)?
-                    .filter(|s| s.visible_to(&viewer))
-                    .ok_or_else(|| ResourceKind::Session.missing(id.as_str()))?;
-                // A session's mode is set when it is created; `mode` on a
-                // later turn is ignored, and PATCH .../sessions/{sid} changes
-                // it explicitly (issue #57).
-                Ok(id)
-            } else {
-                Ok(sessions::create_session(db, &model, mode.unwrap_or_default(), Some(&user))?.id)
-            }
-        })
-        .await?;
-        let unasked = if access.permits(Need::WRITE) {
-            unasked
-        } else {
-            WritePolicy::Deny
-        };
-        let policy = unasked.allowed_if(body.allow_write);
-        let recorder = access.recorder(app).await?;
-        Ok(Self {
-            access,
-            recorder,
-            db,
-            reader,
-            session_id,
-            policy,
-            prompt: body.prompt.clone(),
-            documents: body.document_ids.clone(),
-            model: model_names,
-        })
+                let unasked = if access.permits(Need::WRITE) {
+                    unasked
+                } else {
+                    WritePolicy::Deny
+                };
+                let policy = unasked.allowed_if(body.allow_write);
+                let recorder = access.recorder(app).await?;
+                audit.already_recorded();
+                Ok(Self {
+                    access: access.clone(),
+                    recorder,
+                    db,
+                    reader,
+                    session_id,
+                    policy,
+                    prompt: body.prompt.clone(),
+                    documents: body.document_ids.clone(),
+                    model: model_names,
+                })
+            })
+            .await
     }
 
     /// Submit the turn as a job in its session's lane (one turn at a time
@@ -171,6 +179,14 @@ impl PreparedTurn {
             ))));
         }
         let config = app.engine.config.clone();
+        let audit = Arc::new(TurnAudit {
+            app: Arc::clone(app),
+            access: access.clone(),
+            session_id: session_id.clone(),
+            prompt: prompt.clone(),
+            model,
+            recorded: Notify::new(),
+        });
         let (session, text) = (session_id.clone(), prompt.clone());
         let spec = JobSpec::new(JobKind::Chat, prompt.chars().take(80).collect::<String>())
             .workspace(access.membership.workspace.id.clone())
@@ -180,12 +196,15 @@ impl PreparedTurn {
         let labelling = LabelJobs::new(app.engine.jobs.clone())
             .workspace(access.membership.workspace.id.clone())
             .on_end(recorder.on_classify_end(Some(session_id.clone())));
+        let recording = Arc::clone(&audit);
         let job = app
             .engine
             .jobs
             .submit(spec, move |ctx| async move {
-                // The turn emits TurnComplete or Failed itself.
-                match (llm::TurnRequest {
+                // The turn emits TurnComplete or Failed itself; its row is
+                // written here, from the job's own result, so a client that
+                // has gone away still leaves one.
+                let ended = (llm::TurnRequest {
                     db,
                     reader_db: reader,
                     session_id: &session,
@@ -198,18 +217,37 @@ impl PreparedTurn {
                     cancel: ctx.cancel_token(),
                 })
                 .run(&config)
-                .await
-                {
-                    Ok(response) if response.cancelled => Err(String::from("cancelled")),
-                    Ok(response) => Ok(format!(
-                        "answered: {} steps, {} sources",
-                        response.steps.len(),
-                        response.citations.len()
-                    )),
-                    Err(e) => Err(e.to_string()),
+                .await;
+                match ended {
+                    Ok(response) => {
+                        recording.record(TurnEnd::Answered(&response)).await;
+                        if response.cancelled {
+                            Err(String::from("cancelled"))
+                        } else {
+                            Ok(format!(
+                                "answered: {} steps, {} sources",
+                                response.steps.len(),
+                                response.citations.len()
+                            ))
+                        }
+                    }
+                    Err(e) => {
+                        recording
+                            .record(TurnEnd::Failed(Some(&TurnFailure::from(&e))))
+                            .await;
+                        Err(e.to_string())
+                    }
                 }
             })
             .id;
+        // A job cancelled while it waited never runs, so nothing above
+        // records it.
+        let unstarted = Arc::clone(&audit);
+        app.engine.jobs.when_ended(job, move |ended| async move {
+            if ended.never_started() {
+                unstarted.record(TurnEnd::Failed(None)).await;
+            }
+        });
         Turn {
             events,
             guard: CancelOnDrop {
@@ -218,8 +256,7 @@ impl PreparedTurn {
             },
             access,
             session_id,
-            prompt,
-            model,
+            audit,
         }
     }
 }
@@ -247,9 +284,7 @@ struct Turn {
     guard: CancelOnDrop,
     access: Access,
     session_id: SessionId,
-    prompt: String,
-    /// The chat model's provider and id, for the audit detail.
-    model: (String, String),
+    audit: Arc<TurnAudit>,
 }
 
 /// Whether a turn's stream has sent its `complete` or `error` event.
@@ -282,25 +317,46 @@ impl Turn {
         }
     }
 
+    /// Wait until the turn's job has recorded its end, so a caller who has
+    /// the answer can read the row.
+    async fn recorded(&self) {
+        self.audit.recorded.notified().await;
+    }
+}
+
+/// What a turn's end is recorded against. The turn's job holds it, so the
+/// row is written whatever becomes of the client that asked.
+struct TurnAudit {
+    app: App,
+    access: Access,
+    session_id: SessionId,
+    prompt: String,
+    /// The chat model's provider and id, for the audit detail.
+    model: (String, String),
+    /// Signalled once the end is recorded.
+    recorded: Notify,
+}
+
+impl TurnAudit {
     /// Audit the turn. A failed turn that left the session without any
     /// message (a fresh session whose first turn never reached the model)
     /// is removed, as print mode does, so the session list shows no empty
     /// entries.
-    async fn record(&self, app: &App, end: TurnEnd<'_>) {
-        let (outcome, steps, citations) = match end {
-            TurnEnd::Answered(response) => (
-                Outcome::Allowed,
-                response.steps.clone(),
-                response.citations.clone(),
-            ),
-            TurnEnd::Failed(Some(TurnFailure {
-                kind: FailureKind::ProviderNotAllowed,
-                ..
-            })) => (Outcome::Denied, Vec::new(), Vec::new()),
-            TurnEnd::Failed(_) => (Outcome::Error, Vec::new(), Vec::new()),
+    async fn record(&self, end: TurnEnd<'_>) {
+        let (work, steps, citations) = match end {
+            TurnEnd::Answered(response) => {
+                (Ok(()), response.steps.clone(), response.citations.clone())
+            }
+            TurnEnd::Failed(Some(failure)) => {
+                (Err(ApiError::from(failure.clone())), Vec::new(), Vec::new())
+            }
+            TurnEnd::Failed(None) => (Err(Turn::unanswered(&self.app)), Vec::new(), Vec::new()),
         };
-        if outcome != Outcome::Allowed
-            && let Ok(handle) = app.workspace(&self.access.membership.workspace.id).await
+        if work.is_err()
+            && let Ok(handle) = self
+                .app
+                .workspace(&self.access.membership.workspace.id)
+                .await
         {
             let sid = self.session_id.clone();
             if let Err(e) =
@@ -329,25 +385,20 @@ impl Turn {
                 })
             })
             .collect();
-        let detail = serde_json::json!({
-            "prompt": self.prompt,
-            "model": { "provider": self.model.0, "name": self.model.1 },
-            "steps": steps,
-            "citations": citations,
-        });
-        if let Err(e) = self
-            .access
-            .audit(
-                app,
-                AuditAction::Query,
-                Some(ResourceKind::Session.id(&self.session_id)),
-                outcome,
-                Some(detail),
-            )
-            .await
+        let audit = Audit::of(AuditAction::Query)
+            .resource(ResourceKind::Session, self.session_id.as_str())
+            .detail(serde_json::json!({
+                "prompt": self.prompt,
+                "model": { "provider": self.model.0, "name": self.model.1 },
+                "steps": steps,
+                "citations": citations,
+            }));
+        if let Err(e) = self.access.audited(&self.app, audit, async { work }).await
+            && e.code == ErrorCode::Unaudited
         {
             tracing::error!(error = %e.message, "audit write failed");
         }
+        self.recorded.notify_one();
     }
 }
 
@@ -447,11 +498,10 @@ pub(crate) async fn query(
             | AgentEvent::ToolFinished(_) => {}
         }
     }
+    turn.recorded().await;
     if let Some(response) = complete {
-        turn.record(&app, TurnEnd::Answered(&response)).await;
         return Ok(Json(response.body(&turn.session_id)));
     }
-    turn.record(&app, TurnEnd::Failed(failure.as_ref())).await;
     Err(failure.map_or_else(|| Turn::unanswered(&app), ApiError::from))
 }
 
@@ -483,7 +533,7 @@ pub(crate) async fn stream(
             if state == TurnStream::Ended {
                 return None;
             }
-            turn.record(&app, TurnEnd::Failed(None)).await;
+            turn.recorded().await;
             let out = StreamEvent::Error
                 .event()
                 .json_data(Turn::unanswered(&app).body())
@@ -530,7 +580,7 @@ pub(crate) async fn stream(
                     .unwrap_or_default()
             }
             AgentEvent::TurnComplete(response) => {
-                turn.record(&app, TurnEnd::Answered(&response)).await;
+                turn.recorded().await;
                 // The web page swaps this in for the streamed plain text.
                 let payload = CompleteEvent {
                     answer_html: to_html(&response.content),
@@ -547,7 +597,7 @@ pub(crate) async fn stream(
                     .unwrap_or_default()
             }
             AgentEvent::Failed(failure) => {
-                turn.record(&app, TurnEnd::Failed(Some(&failure))).await;
+                turn.recorded().await;
                 StreamEvent::Error
                     .event()
                     .json_data(ApiError::from(failure).body())
@@ -670,46 +720,41 @@ impl Access {
         format: ExportFormat,
     ) -> ApiResult<Response> {
         let workspace_id = self.membership.workspace.id.clone();
-        let sql = statement.clone();
-        // The open's own failure (a locked file) keeps its code; only a
-        // statement the classifier refuses is forbidden.
-        let kind = match app
-            .read(
-                &workspace_id,
-                move |db| Ok(db.classify_user_statement(&sql)),
-            )
-            .await?
-        {
-            Ok(kind) => kind,
-            Err(e) => {
-                let message = e.to_string();
-                self.audit(
-                    app,
-                    AuditAction::Export,
-                    None,
-                    Outcome::Denied,
-                    Some(
-                        serde_json::json!({ "sql": statement, "format": format, "error": message }),
-                    ),
-                )
-                .await?;
-                return Err(classification_failed(e));
-            }
-        };
-        if kind.writes().map_err(ApiError::bad_request)? {
-            self.audit(
-                app,
-                AuditAction::Export,
-                None,
-                Outcome::Denied,
-                Some(serde_json::json!({ "sql": statement, "format": format })),
-            )
+        // The row of an export that starts is written when its stream ends.
+        let audit = Audit::of(AuditAction::Export)
+            .detail(serde_json::json!({ "sql": statement, "format": format }));
+        let reader = self
+            .audited_with(app, audit, async |audit| {
+                let sql = statement.clone();
+                // The open's own failure (a locked file) keeps its code; only a
+                // statement the classifier refuses is forbidden.
+                let classified = app
+                    .read(
+                        &workspace_id,
+                        move |db| Ok(db.classify_user_statement(&sql)),
+                    )
+                    .await?;
+                let kind = match classified {
+                    Ok(kind) => kind,
+                    Err(e) => {
+                        audit.refused();
+                        audit.set_detail(serde_json::json!({
+                            "sql": statement, "format": format, "error": e.to_string(),
+                        }));
+                        return Err(classification_failed(e));
+                    }
+                };
+                if kind.writes().map_err(ApiError::bad_request)? {
+                    audit.refused();
+                    return Err(ApiError::bad_request(
+                        "only a read statement can be exported",
+                    ));
+                }
+                let reader = app.workspace(&workspace_id).await?.reader;
+                audit.already_recorded();
+                Ok(reader)
+            })
             .await?;
-            return Err(ApiError::bad_request(
-                "only a read statement can be exported",
-            ));
-        }
-        let reader = app.workspace(&workspace_id).await?.reader;
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
         let failed = tx.clone();
         let audit_app = Arc::clone(app);
@@ -725,24 +770,25 @@ impl Access {
                     Ok(rows)
                 })
                 .await;
-            let (outcome, detail) = match written {
+            let (work, detail) = match written {
                 Ok(rows) => (
-                    Outcome::Allowed,
+                    Ok(()),
                     serde_json::json!({ "sql": statement, "format": format, "rows": rows }),
                 ),
                 Err(e) => {
                     tracing::warn!(workspace = %workspace_id, error = %e, "sql export failed partway");
                     drop(failed.send(Err(io::Error::other(e.to_string()))).await);
-                    (
-                        Outcome::Error,
-                        serde_json::json!({ "sql": statement, "format": format, "error": e.to_string() }),
-                    )
+                    let detail = serde_json::json!({
+                        "sql": statement, "format": format, "error": e.to_string(),
+                    });
+                    (Err(ApiError::from(e)), detail)
                 }
             };
+            let exported = work.is_ok();
             drop(failed);
-            if let Err(e) = self
-                .audit(&audit_app, AuditAction::Export, None, outcome, Some(detail))
-                .await
+            let audit = Audit::of(AuditAction::Export).detail(detail);
+            if let Err(e) = self.audited(&audit_app, audit, async { work }).await
+                && exported
             {
                 tracing::error!(workspace = %workspace_id, error = %e.message, "could not audit a sql export");
             }
@@ -767,75 +813,71 @@ impl Access {
     /// and the web grid share.
     pub(crate) async fn execute_sql(&self, app: &App, statement: &str) -> ApiResult<SqlOutcome> {
         let access = self;
-        let sql = statement.to_owned();
-        // Classifying parses the statement: a read, never in the writer's line.
-        // The open's own failure (a locked file) keeps its code; only a
-        // statement the classifier refuses is forbidden.
-        let kind = app
-            .read(&access.membership.workspace.id, move |db| {
-                Ok(db.classify_user_statement(&sql))
-            })
-            .await?
-            .map_err(classification_failed)?;
-        let is_write = kind.writes().map_err(ApiError::bad_request)?;
-        let detail = serde_json::json!({ "sql": statement });
-        if is_write && creates_temp_object(statement) {
-            access
-                .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
-                .await?;
-            return Err(ApiError::bad_request(TEMP_OBJECT_REFUSED));
-        }
-        if is_write && !access.permits(Need::WRITE) {
-            access
-                .audit(app, AuditAction::Sql, None, Outcome::Denied, Some(detail))
-                .await?;
-            return Err(ApiError::forbidden(
-                "writes need the member role and the write scope",
-            ));
-        }
-        let reader_db = app.workspace(&access.membership.workspace.id).await?.reader;
-        let sql = statement.to_owned();
-        let max_rows = app.engine.config.analysis.max_query_rows;
-        let timed = move |db: &WorkspaceDb| {
-            let began = Instant::now();
-            db.execute_query_capped(&sql, max_rows)
-                .map(|capped| (capped, began.elapsed()))
-        };
-        let result = if is_write {
-            let db = app.workspace(&access.membership.workspace.id).await?.writer;
-            let result = with_db(Arc::clone(&db), timed).await;
-            // Whatever ran might have created a temp object the check above
-            // did not catch (a leading comment, a multi-statement batch);
-            // check the writer's catalog regardless of whether the statement
-            // itself errored, since an earlier statement in a batch can have
-            // already run.
-            reader_db.observe_write().await;
-            TableProfile::after_write(&db).await;
-            result
-        } else {
-            // A read never queues behind a write: run it on the workspace's
-            // reader connection instead of the writer.
-            reader_db.with_db(timed).await.map_err(ApiError::from)
-        };
-        let outcome = Outcome::of(&result);
+        let audit = Audit::of(AuditAction::Sql).detail(serde_json::json!({ "sql": statement }));
         access
-            .audit(app, AuditAction::Sql, None, outcome, Some(detail))
-            .await?;
-        let (mut capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
-        // The row cap bounds nothing by itself: a wide cell or a few wide
-        // rows would be buffered and sent whole. The same byte bound as the
-        // MCP tool's; `/sql/export` streams every row.
-        let cut = capped.bound_bytes(STRUCTURED_RESULT_BYTES, STRUCTURED_CELL_CHARS);
-        Ok(SqlOutcome {
-            truncated: capped.truncated(),
-            cells_cut: cut.cells,
-            row_count_exact: !capped.stopped_early,
-            columns: capped.results.columns,
-            column_types: capped.column_types,
-            rows: capped.results.rows,
-            row_count: capped.total_rows,
-            duration_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
-        })
+            .audited_with(app, audit, async |audit| {
+                let sql = statement.to_owned();
+                // Classifying parses the statement: a read, never in the writer's line.
+                // The open's own failure (a locked file) keeps its code; only a
+                // statement the classifier refuses is forbidden.
+                let kind = app
+                    .read(&access.membership.workspace.id, move |db| {
+                        Ok(db.classify_user_statement(&sql))
+                    })
+                    .await?
+                    .map_err(classification_failed)?;
+                let is_write = kind.writes().map_err(ApiError::bad_request)?;
+                if is_write && creates_temp_object(statement) {
+                    audit.refused();
+                    return Err(ApiError::bad_request(TEMP_OBJECT_REFUSED));
+                }
+                if is_write && !access.permits(Need::WRITE) {
+                    return Err(ApiError::forbidden(
+                        "writes need the member role and the write scope",
+                    ));
+                }
+                let reader_db = app.workspace(&access.membership.workspace.id).await?.reader;
+                let sql = statement.to_owned();
+                let max_rows = app.engine.config.analysis.max_query_rows;
+                let timed = move |db: &WorkspaceDb| {
+                    let began = Instant::now();
+                    db.execute_query_capped(&sql, max_rows)
+                        .map(|capped| (capped, began.elapsed()))
+                };
+                let result = if is_write {
+                    let db = app.workspace(&access.membership.workspace.id).await?.writer;
+                    let result = with_db(Arc::clone(&db), timed).await;
+                    // Whatever ran might have created a temp object the check above
+                    // did not catch (a leading comment, a multi-statement batch);
+                    // check the writer's catalog regardless of whether the statement
+                    // itself errored, since an earlier statement in a batch can have
+                    // already run.
+                    reader_db.observe_write().await;
+                    TableProfile::after_write(&db).await;
+                    result
+                } else {
+                    // A read never queues behind a write: run it on the workspace's
+                    // reader connection instead of the writer.
+                    reader_db.with_db(timed).await.map_err(ApiError::from)
+                };
+                let (mut capped, took) =
+                    result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
+                // The row cap bounds nothing by itself: a wide cell or a few wide
+                // rows would be buffered and sent whole. The same byte bound as the
+                // MCP tool's; `/sql/export` streams every row.
+                let cut = capped.bound_bytes(STRUCTURED_RESULT_BYTES, STRUCTURED_CELL_CHARS);
+                Ok(SqlOutcome {
+                    truncated: capped.truncated(),
+                    cells_cut: cut.cells,
+                    row_count_exact: !capped.stopped_early,
+                    columns: capped.results.columns,
+                    column_types: capped.column_types,
+                    rows: capped.results.rows,
+                    row_count: capped.total_rows,
+                    duration_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+                })
+            })
+            .await
     }
 }
 
@@ -910,43 +952,21 @@ impl Access {
     /// page share. A search that fails after authorization is audited
     /// before its error is returned.
     pub(crate) async fn search(&self, app: &App, q: &SearchQuery) -> ApiResult<SearchOutcome> {
-        let search = q.search(app)?;
-        let model = self
-            .model(
-                app,
-                AuditAction::Search,
-                Embeddings::from_config(&app.engine.config).await,
-            )
-            .await?;
-        let rerank = self
-            .model(
-                app,
-                AuditAction::Search,
-                Rerank::from_config(&app.engine.config).await,
-            )
-            .await?;
-        let found = async {
+        self.audited_with(app, Audit::of(AuditAction::Search), async |audit| {
+            let search = q.search(app)?;
+            audit.set_detail(serde_json::json!({ "q": search.query, "search": search.describe() }));
+            let model = Embeddings::from_config(&app.engine.config).await?;
+            let rerank = Rerank::from_config(&app.engine.config).await?;
             let reader = app.workspace(&self.membership.workspace.id).await?.reader;
-            search
+            Ok(search
                 .run(
                     &reader,
                     model.as_ref(),
                     rerank.as_ref(),
                     app.engine.config.retrieval.rrf_k,
                 )
-                .await
-                .map_err(ApiError::from)
-        }
-        .await;
-        let outcome = Outcome::of(&found);
-        self.audit(
-            app,
-            AuditAction::Search,
-            None,
-            outcome,
-            Some(serde_json::json!({ "q": search.query, "search": search.describe() })),
-        )
-        .await?;
-        found
+                .await?)
+        })
+        .await
     }
 }

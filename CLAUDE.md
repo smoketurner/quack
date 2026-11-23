@@ -227,7 +227,7 @@ entered by `Access::resolve` in the server, `OpenedWorkspace` on the command lin
 `Egress::permit` is the one check, called when a model client is built from a `ModelRef` (a typed
 `Error::ProviderRefused` holding the `egress::Refusal`, and `Error::is_provider_refusal` is what
 the audit outcome and a turn's failure kind ask: 403 and a `denied` audit row through
-`Access::model`, exit 1 from the CLI) and again by `ProviderGates::permit` for every request,
+`Access::audited`, exit 1 from the CLI) and again by `ProviderGates::permit` for every request,
 Bedrock's SDK requests included. A request with no scope is `Error::ModelRequestUnscoped`, never an
 allow, so a test that makes a model request enters a scope first. Under a restricted list an Ollama
 model whose id ends in `-cloud` or `:cloud` is refused. Every outbound HTTP client takes its proxy from `quack_core::proxy::Proxies`
@@ -575,7 +575,7 @@ for a client that declares the tasks extension `query` answers with a task (rmcp
 `quack mcp` serves it on stdio (unaudited, like the CLI; or relays to the holder's socket), and `quack-server`'s `mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
 permission, each request carrying an `McpCaller` (core's `storage::audit::Recorder`, both audit
-halves for that person in that workspace, which `Access::audit` and background runs also record
+halves for that person in that workspace, which `Access::audited` and background runs also record
 through), audited with channel `mcp`. With `[server.oidc].audience` set, the API and MCP also
 accept the issuer's access tokens (`SignIn::verify_bearer`, `jsonwebtoken` on aws-lc-rs), publish
 `/.well-known/oauth-protected-resource` (`server::resource`), and send `WWW-Authenticate:
@@ -640,9 +640,17 @@ limiter covers the web UI, the API, and MCP, with a tighter one on the two login
 none on `/healthz` (design doc 12). The same routes carry `no-store` cache headers
 (`server::no_store`) unless the handler set `Cache-Control` itself, as the static assets
 do. Every
-workspace-touching handler then records the allowed row plus its `_quack_audit` detail
-through `Access::audit`; one that changes the control plane commits the row with the change
-(`Access::entry`) and writes only the detail after (`Access::record_detail`).
+workspace-touching handler then runs its work through `Access::audited` (or `audited_with`, where
+the work fills in the resource and detail it learns), which records the row plus its
+`_quack_audit` detail after the work, from its result: `allowed`, `denied` for a 403 or a provider
+the workspace refuses, `error` for anything else, so a request that fails after authorization
+leaves a row. The forms that take an outcome (`Access::audit`, `Recorder::record`, `Recorder::entry`)
+are private to `auth` or disallowed by `.clippy.toml`; a check inside a handler that refuses the
+request calls `Audit::refused` or `Access::denied`. A turn's row is written by the turn's job
+(`api/query.rs`'s `TurnAudit`), so a client that drops the stream still leaves it. A change that
+touches the control plane commits the row with the change (`Access::committed_entry`), marks the
+audit `already_recorded`, and writes only the detail after (`Access::record_detail`). The MCP server
+does the same through `Caller::audited` (`crates/quack-mcp/src/caller.rs`).
 A handler's reads go through `App::read` (a reader-pool
 connection in a read-only transaction, so a read never occupies the writer and a write
 slipped into one is refused); its writes go to the writer through `state::with_db`; and

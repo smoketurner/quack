@@ -29,6 +29,10 @@ use quack_core::web_sessions::{SessionLookup, SessionToken};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 
+mod audited;
+
+pub(crate) use audited::Audit;
+
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
@@ -568,7 +572,7 @@ impl Access {
     /// committed in the workspace file, so a failed write is `unaudited`
     /// (#600): a 500 saying the work stands, never one that reads as the
     /// work having failed.
-    pub(crate) async fn audit(
+    async fn audit(
         &self,
         app: &App,
         action: AuditAction,
@@ -577,11 +581,13 @@ impl Access {
         detail: Option<serde_json::Value>,
     ) -> ApiResult<AuditId> {
         let what = action.to_string();
-        self.recorder(app)
-            .await?
-            .record(action, resource, outcome, detail)
-            .await
-            .map_err(|e| {
+        let recorder = self.recorder(app).await?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "private to `auth`: `audited` and `denied` are the handlers' way in"
+        )]
+        let recorded = recorder.record(action, resource, outcome, detail).await;
+        recorded.map_err(|e| {
                 tracing::error!(error = %e, action = what, "audit write failed after the work it records");
                 ApiError::unaudited()
             })
@@ -603,10 +609,11 @@ impl Access {
     }
 
     /// An `audit_log` entry for this caller in this workspace, for a change
-    /// that commits it itself.
-    pub(crate) fn entry(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
+    /// that commits it itself: the row is written in the change's own
+    /// transaction, so it exists only when the change stands.
+    pub(crate) fn committed_entry(&self, action: AuditAction) -> AuditEntry {
         self.identity
-            .audit(action, outcome)
+            .audit(action, Outcome::Allowed)
             .in_workspace(&self.membership.workspace.id)
     }
 
@@ -622,25 +629,6 @@ impl Access {
             .await?
             .record_detail(entry, detail)
             .await?)
-    }
-
-    /// The allowed row for a read that returns a listing or a page:
-    /// action `list` or `page`, what was read in the detail.
-    pub(crate) async fn audit_read(
-        &self,
-        app: &App,
-        action: AuditAction,
-        what: &str,
-    ) -> ApiResult<()> {
-        self.audit(
-            app,
-            action,
-            None,
-            Outcome::Allowed,
-            Some(serde_json::json!({ "what": what })),
-        )
-        .await?;
-        Ok(())
     }
 }
 
@@ -711,30 +699,6 @@ impl Access {
         // to the model providers the workspace allows.
         Egress::Workspace(access.membership.workspace.allowed_providers.clone()).enter();
         Ok(access)
-    }
-
-    /// The model `built` for work on this workspace, or why not: a provider
-    /// the workspace's allow-list refuses is 403 and a denied row for
-    /// `action`, any other failure an error row, and the detail says which.
-    pub(crate) async fn model<T>(
-        &self,
-        app: &App,
-        action: AuditAction,
-        built: Result<T, CoreError>,
-    ) -> ApiResult<T> {
-        let error = match built {
-            Ok(model) => return Ok(model),
-            Err(error) => error,
-        };
-        self.audit(
-            app,
-            action,
-            None,
-            Outcome::of_failure(&error),
-            Some(serde_json::json!({ "error": error.to_string() })),
-        )
-        .await?;
-        Err(ApiError::from(error))
     }
 }
 
