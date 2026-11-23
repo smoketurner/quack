@@ -478,6 +478,10 @@ pub enum TemporaryClient {
     /// Still registered at the issuer. quack keeps its record while it can
     /// still delete it, and tries again on the next `quack auth register`.
     Left { client_id: String, reason: String },
+    /// The issuer returned no registration token for it, so quack cannot
+    /// delete it (now or ever) and has forgotten its record; delete it in
+    /// the issuer's console.
+    Unmanaged { client_id: String },
 }
 
 /// What a registration starts from, checked before anything is sent.
@@ -1001,10 +1005,7 @@ impl Registrar {
             Removal::Deleted { client_id } | Removal::AlreadyGone { client_id, .. } => {
                 TemporaryClient::Deleted { client_id }
             }
-            Removal::Unmanaged { client_id } => TemporaryClient::Left {
-                client_id,
-                reason: String::from("the issuer returned no registration access token for it"),
-            },
+            Removal::Unmanaged { client_id } => TemporaryClient::Unmanaged { client_id },
             Removal::Left { client_id, reason } => {
                 return TemporaryClient::Left { client_id, reason };
             }
