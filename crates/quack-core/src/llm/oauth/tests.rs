@@ -71,6 +71,10 @@ struct MockState {
     no_public_clients: std::sync::atomic::AtomicBool,
     /// Issue a new registration access token with each update.
     rotate_registration_token: std::sync::atomic::AtomicBool,
+    /// Omit `registration_access_token` and `registration_client_uri` from
+    /// the registration answer, so the client is `Unmanaged` (RFC 7592
+    /// cannot reach it).
+    omit_registration_token: std::sync::atomic::AtomicBool,
 }
 
 type BeforeRefusal = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -361,14 +365,16 @@ fn register_client(
     if let Some(fields) = answer.as_object_mut() {
         fields.insert(String::from("client_id"), serde_json::json!(id));
         fields.insert(String::from("client_id_issued_at"), serde_json::json!(1));
-        fields.insert(
-            String::from("registration_access_token"),
-            serde_json::json!(token),
-        );
-        fields.insert(
-            String::from("registration_client_uri"),
-            serde_json::json!(format!("{base}/register/{id}")),
-        );
+        if !state.omit_registration_token.load(Ordering::SeqCst) {
+            fields.insert(
+                String::from("registration_access_token"),
+                serde_json::json!(token),
+            );
+            fields.insert(
+                String::from("registration_client_uri"),
+                serde_json::json!(format!("{base}/register/{id}")),
+            );
+        }
     }
     registered_key(&parsed, state);
     if let Ok(mut registered) = state.registered_id.lock() {
