@@ -553,7 +553,7 @@ impl Access {
         }
         match self.membership.standing {
             Standing::Member(role) => role >= need.role,
-            Standing::Admin => need.admin_ok && self.identity.is_admin(),
+            Standing::Admin => need.admin_ok && self.identity.kind == UserKind::Admin,
         }
     }
 
@@ -692,7 +692,7 @@ impl Access {
         };
         if !access.permits(need) {
             let reason = match access.membership.standing {
-                Standing::Admin if access.identity.is_admin() => {
+                Standing::Admin if access.identity.kind == UserKind::Admin => {
                     "admins read workspace content only as members"
                 }
                 Standing::Admin => "not a member of this workspace",
@@ -749,7 +749,7 @@ impl Identity {
     /// Whether this caller acts as a server admin. An API token acts for
     /// its admin owner only when it carries the `admin` scope itself: a
     /// read or write token an admin made for one workspace is not a key to
-    /// the whole server. Every admin check asks this, never `kind` alone.
+    /// the whole server: not server administration, not every member's sessions.
     pub(crate) fn is_admin(&self) -> bool {
         let scoped = match &self.credential {
             Credential::Token(token) => token.has_scope(Scope::Admin),

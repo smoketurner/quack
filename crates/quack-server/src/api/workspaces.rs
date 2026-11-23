@@ -16,7 +16,7 @@ use quack_core::okf;
 use quack_core::storage::audit::{self, AuditDetailRow};
 use quack_core::storage::backup::{Described, Manifest, RestoreRequest, Restored};
 use quack_core::storage::control::{
-    AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing,
+    AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
     WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
 use quack_mcp::client::HeldElsewhere;
@@ -65,7 +65,7 @@ pub(crate) async fn list(
             .member_role(&token.workspace_id, &identity.user_id)
             .await?;
         ws.into_iter()
-            .filter(|_| role.is_some() || identity.is_admin())
+            .filter(|_| role.is_some() || identity.kind == UserKind::Admin)
             .map(|w| Membership {
                 workspace: w,
                 standing: Standing::of(role),
