@@ -416,7 +416,7 @@ async fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
         .flatten()
         .unwrap_or_else(|| fail("the turn did not end"));
     assert_eq!(finished.state, JobState::Cancelled);
-    app.turns.clear();
+    // The turn ended but has not closed yet: Ctrl+C still quits.
     app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert_eq!(app.quit, Quit::Now, "Ctrl+C with nothing running quits");
 }
