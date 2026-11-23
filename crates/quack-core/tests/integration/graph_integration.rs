@@ -2139,6 +2139,72 @@ fn a_person_asserts_nodes_and_edges_under_the_ontology() {
     assert!(ambiguous.contains("graph node"), "{ambiguous}");
 }
 
+/// A path whose last edge comes after the node budget ran out on its level
+/// is still found; one the budget cut short says so rather than "no path".
+#[test]
+fn a_path_one_edge_past_the_node_budget_is_found() {
+    let (db, _, ada) = asserting();
+    let po1 = graph_store::find_node(&db, "PO-1", Some("shipment")).unwrap();
+    let node = |name: &str| {
+        graph_store::create_node(&db, &vendor(name, name), &ada)
+            .unwrap()
+            .subject
+    };
+    let (first, last, apart) = (
+        node("First Vendor"),
+        node("Last Vendor"),
+        node("Apart Vendor"),
+    );
+    for v in [&first, &last] {
+        graph_store::create_edge(&db, &supplied_by(&po1.id, &v.id), &ada).unwrap();
+    }
+    let options = GraphConfig {
+        max_nodes: 2,
+        ..GraphConfig::default()
+    };
+    let path = traverse::path(&db, &po1, &last, Hops::new(1), &options).unwrap();
+    assert_eq!(path.edges.len(), 1, "{path:?}");
+    assert!(!path.truncated);
+    let none = traverse::path(&db, &po1, &apart, Hops::new(3), &options).unwrap();
+    assert!(none.edges.is_empty());
+    assert!(
+        none.truncated,
+        "a cut-short search is not reported as no path"
+    );
+}
+
+/// A merge drops only the edges between the two nodes it merges; a
+/// self-loop elsewhere in the graph, a person's included, stays.
+#[test]
+fn a_merge_keeps_self_loops_it_did_not_make() {
+    let (db, _, ada) = asserting();
+    let po1 = graph_store::find_node(&db, "PO-1", Some("shipment")).unwrap();
+    let keep = graph_store::create_node(&db, &vendor("Keep Vendor", "Keep"), &ada).unwrap();
+    let drop = graph_store::create_node(&db, &vendor("Drop Vendor", "Drop"), &ada).unwrap();
+    let looped = graph_store::create_edge(&db, &supplied_by(&po1.id, &keep.subject.id), &ada)
+        .unwrap()
+        .subject
+        .id;
+    // The ontology allows no shipment-to-shipment relation, so the loop is
+    // written directly, as an older ontology could have left one.
+    db.connection()
+        .execute(
+            "UPDATE _quack_graph_edges SET target_node_id = source_node_id WHERE id = ?",
+            [looped.as_str()],
+        )
+        .unwrap();
+    resolve::merge_nodes(&db, &keep.subject.id, &drop.subject.id).unwrap();
+    let kept: u64 = db
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM _quack_graph_edges WHERE id = ?",
+            [looped.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1, "an unrelated self-loop was deleted by the merge");
+}
+
 /// A correction changes the label and the properties; a label another
 /// node of the class holds, and a class the node's edges no longer fit,
 /// are refused.

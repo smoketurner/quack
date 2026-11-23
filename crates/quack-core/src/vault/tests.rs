@@ -82,6 +82,46 @@ async fn another_subject_or_an_altered_value_does_not_open() {
 }
 
 #[tokio::test]
+async fn a_value_whose_key_id_is_corrupted_but_key_is_present_is_recovered() {
+    // `key_id` is the one `Sealed` field HPKE does not authenticate (only
+    // `subject` is AAD, only `purpose` is the HPKE `info`). When `key_id` is
+    // corrupted but the present key IS the sealing key, HPKE `open` still
+    // succeeds — so `open` must recover the value, not misclassify it as
+    // `KeyGone`.
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let vault = Vault::new(dir.path(), KeySource::File);
+    let plaintext = b"the recoverable secret";
+    let sealed = vault
+        .seal(Purpose::UserToken, "ada", plaintext)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    // Corrupt only `key_id`, leaving `enc` and `ciphertext` untouched.
+    let mut corrupted = sealed.clone();
+    corrupted.key_id = corrupted
+        .key_id
+        .char_indices()
+        .map(|(i, c)| {
+            if i == 0 {
+                if c == '0' { '1' } else { '0' }
+            } else {
+                c
+            }
+        })
+        .collect();
+    assert_ne!(corrupted.key_id, sealed.key_id);
+    assert_eq!(corrupted.enc, sealed.enc);
+    assert_eq!(corrupted.ciphertext, sealed.ciphertext);
+
+    // The present key IS the sealing key, so HPKE open succeeds and the
+    // value is recovered — not misclassified as `KeyGone`.
+    assert_eq!(
+        opened(vault.open(Purpose::UserToken, "ada", &corrupted).await).as_deref(),
+        Some(&plaintext[..])
+    );
+}
+
+#[tokio::test]
 async fn a_value_whose_key_is_gone_says_so_and_opening_makes_no_key() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let vault = Vault::new(dir.path(), KeySource::File);

@@ -18,7 +18,8 @@ use crate::error::{Error, Result};
 /// Returns an error when the page holds no text.
 pub fn html(text: &str) -> Result<Extracted> {
     let document = Html::parse_document(text);
-    let title = Selector::parse("title")
+    // The page's own title only: an SVG or stray body `<title>` is not it.
+    let title = Selector::parse("head > title")
         .ok()
         .and_then(|sel| document.select(&sel).next())
         .map(|el| el.text().collect::<String>())
@@ -236,6 +237,18 @@ fn collapse(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_outside_the_head_is_not_the_documents() {
+        for page in [
+            "<html><body><svg><title>Icon</title></svg><h1>Report</h1><p>Text.</p></body></html>",
+            "<html><body><h1>Report</h1><title>Stray</title><p>Text.</p></body></html>",
+        ] {
+            let extracted = html(page).unwrap_or_default();
+            assert!(!extracted.sections.is_empty(), "{page}");
+            assert_eq!(extracted.title, None, "{page}");
+        }
+    }
 
     #[test]
     fn sections_follow_headings_and_the_title_is_read() {

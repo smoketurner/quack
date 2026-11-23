@@ -232,20 +232,27 @@ impl Vault {
     /// Returns an error when the value does not open under the key that
     /// sealed it: altered, or sealed for another purpose or subject.
     pub async fn open(&self, purpose: Purpose, subject: &str, sealed: &Sealed) -> Result<Opened> {
-        let key = match self.opening_key().await? {
-            Some(key) if key.id == sealed.key_id => key,
-            Some(_) | None => return Ok(Opened::KeyGone),
+        let Some(key) = self.opening_key().await? else {
+            return Ok(Opened::KeyGone);
         };
-        suite()
-            .open(
-                &EncapsulatedSecret(sealed.enc.clone()),
-                &purpose.info(),
-                subject.as_bytes(),
-                &sealed.ciphertext,
-                &key.private,
-            )
-            .map(Opened::Plaintext)
-            .map_err(|_| vault_error(format!("a sealed {purpose} for {subject} does not open")))
+        match suite().open(
+            &EncapsulatedSecret(sealed.enc.clone()),
+            &purpose.info(),
+            subject.as_bytes(),
+            &sealed.ciphertext,
+            &key.private,
+        ) {
+            Ok(plaintext) => Ok(Opened::Plaintext(plaintext)),
+            Err(_) => {
+                if key.id == sealed.key_id {
+                    Err(vault_error(format!(
+                        "a sealed {purpose} for {subject} does not open"
+                    )))
+                } else {
+                    Ok(Opened::KeyGone)
+                }
+            }
+        }
     }
 }
 

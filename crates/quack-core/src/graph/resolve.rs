@@ -463,8 +463,7 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
         "UPDATE _quack_graph_nodes SET properties = ?, provisional = provisional AND ? WHERE id = ?",
         duckdb::params![properties.to_json(), drop_node.standing, keep],
     )?;
-    // Repoint edges, dropping any that would duplicate an existing triple
-    // or become a self-loop.
+    // Repoint edges, dropping any that would duplicate an existing triple.
     conn.execute(
         "DELETE FROM _quack_provenance WHERE subject_id IN ( \
             SELECT e.id FROM _quack_graph_edges e WHERE (e.source_node_id = ? OR e.target_node_id = ?) \
@@ -480,6 +479,19 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
                 AND k.target_node_id = CASE WHEN e.target_node_id = ? THEN ? ELSE e.target_node_id END)",
         duckdb::params![drop, drop, drop, keep, drop, keep],
     )?;
+    // An edge between the two would become a self-loop; self-loops the
+    // graph already holds, elsewhere or on either node, stay.
+    let between = "(source_node_id = ? AND target_node_id = ?) OR (source_node_id = ? AND target_node_id = ?)";
+    conn.execute(
+        &format!(
+            "DELETE FROM _quack_provenance WHERE subject_id IN (SELECT id FROM _quack_graph_edges WHERE {between})"
+        ),
+        duckdb::params![keep, drop, drop, keep],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM _quack_graph_edges WHERE {between}"),
+        duckdb::params![keep, drop, drop, keep],
+    )?;
     conn.execute(
         "UPDATE _quack_graph_edges SET source_node_id = ? WHERE source_node_id = ?",
         duckdb::params![keep, drop],
@@ -487,14 +499,6 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
     conn.execute(
         "UPDATE _quack_graph_edges SET target_node_id = ? WHERE target_node_id = ?",
         duckdb::params![keep, drop],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_provenance WHERE subject_id IN (SELECT id FROM _quack_graph_edges WHERE source_node_id = target_node_id)",
-        [],
-    )?;
-    conn.execute(
-        "DELETE FROM _quack_graph_edges WHERE source_node_id = target_node_id",
-        [],
     )?;
     conn.execute(
         "INSERT OR IGNORE INTO _quack_provenance \

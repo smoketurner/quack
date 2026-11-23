@@ -1,6 +1,7 @@
 pub mod budget;
 pub mod captions;
 pub mod chunker;
+mod claim;
 pub mod code;
 pub mod epub;
 pub mod html;
@@ -20,6 +21,8 @@ pub mod yaml;
 pub mod zipped;
 
 use std::borrow::Cow;
+
+use self::claim::TableClaim;
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -556,6 +559,8 @@ impl Pending {
             tracing::info!(document = %failed, file = %self.filename, "removed an earlier failed attempt at the file");
         }
         let doc_id = DocumentId::generate();
+        let table = matches!(self.file_type.load(), Load::Table(_))
+            .then(|| TableName::of_file(&self.filename));
         db.insert_document_replacing(
             &NewDocument {
                 id: &doc_id,
@@ -572,6 +577,11 @@ impl Pending {
             },
             self.replaces.as_ref(),
         )?;
+        // Claimed with the row, in this step, so a racing ingest of the same
+        // table name is refused before this one has loaded anything.
+        if let Some(table) = table {
+            table.claim(db, &doc_id)?;
+        }
         Ok(Registration::New(doc_id))
     }
 }
@@ -1193,7 +1203,7 @@ pub fn load_stdin_table(
         name: "standard input",
         path: &path,
     }
-    .create(db, STDIN_TABLE, TableKind::Temp);
+    .create(db, LoadTarget::Stdin);
     if let Err(e) = std::fs::remove_file(&dest) {
         tracing::warn!(path = %dest.display(), error = %e, "could not remove the stdin scratch file");
     }
@@ -1229,8 +1239,7 @@ impl StructuredLoad {
     /// `DuckDB`'s reader for the type. The path is bound, never
     /// interpolated.
     fn load(&self, db: &WorkspaceDb) -> Result<String> {
-        let table_name = TableName::of_file(&self.filename);
-        table_name.check_free(db, Some(&self.doc_id))?;
+        let claim = TableName::of_file(&self.filename).claim(db, &self.doc_id)?;
         let files_dir = self.config.workspace_files_dir(&self.workspace_id);
         std::fs::create_dir_all(&files_dir)?;
         let dest =
@@ -1253,9 +1262,9 @@ impl StructuredLoad {
             name: &self.filename,
             path: &path,
         }
-        .create(db, table_name.as_str(), TableKind::Stored)?;
-        tracing::info!(table = %table_name, file = %self.filename, "created table from structured file");
-        Ok(table_name.into_string())
+        .create(db, LoadTarget::Stored(&claim))?;
+        tracing::info!(table = claim.as_str(), file = %self.filename, "created table from structured file");
+        Ok(claim.into_name())
     }
 }
 
@@ -1273,6 +1282,14 @@ impl TableKind {
             Self::Stored => "TABLE",
         }
     }
+}
+
+/// Where a loaded file goes: a stored table the document has claimed, or the
+/// temporary `stdin` table, which no document owns.
+#[derive(Clone, Copy)]
+enum LoadTarget<'a> {
+    Stored(&'a TableClaim),
+    Stdin,
 }
 
 /// One data file under `files/`, loaded into a table with `DuckDB`'s
@@ -1299,7 +1316,11 @@ impl TableLoad<'_> {
     /// — at the sniffer, the dialect sniff, or the strict re-read — so the
     /// on-disk path `DuckDB`'s reader error names never reaches the person;
     /// the raw reader error is logged only.
-    fn create(&self, db: &WorkspaceDb, table: &str, kind: TableKind) -> Result<()> {
+    fn create(&self, db: &WorkspaceDb, target: LoadTarget<'_>) -> Result<()> {
+        let (table, kind) = match target {
+            LoadTarget::Stored(claim) => (claim.as_str(), TableKind::Stored),
+            LoadTarget::Stdin => (STDIN_TABLE, TableKind::Temp),
+        };
         let create = format!(
             "CREATE OR REPLACE {} {} AS SELECT * FROM ",
             kind.as_sql(),
@@ -1401,10 +1422,10 @@ impl WorkbookLoad {
             })
             .collect();
         // Two distinct sheet names can sanitize to one table name (spaces
-        // and hyphens both become `_`); `check_free` cannot see in-flight
-        // tables, so catch an intra-workbook collision before any file or
-        // table is written, else the second sheet's `CREATE OR REPLACE` would
-        // silently overwrite the first.
+        // and hyphens both become `_`); the claims below are per document, so
+        // catch an intra-workbook collision before any file or table is
+        // written, else the second sheet's `CREATE OR REPLACE` would silently
+        // overwrite the first.
         let mut first_sheet_for: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for (sheet, name) in self.sheets.iter().zip(&names) {
@@ -1416,10 +1437,13 @@ impl WorkbookLoad {
                 )));
             }
             first_sheet_for.insert(name.as_str().to_owned(), sheet.sheet.clone());
-            name.check_free(db, Some(&self.doc_id))?;
         }
+        let claims = names
+            .iter()
+            .map(|name| name.claim(db, &self.doc_id))
+            .collect::<Result<Vec<_>>>()?;
         let mut tables = Vec::with_capacity(self.sheets.len());
-        for (sheet, table_name) in self.sheets.into_iter().zip(names) {
+        for (sheet, table_name) in self.sheets.into_iter().zip(claims) {
             let create_sql = format!(
                 "CREATE OR REPLACE TABLE {} ({})",
                 quote_ident(table_name.as_str()),
@@ -1440,8 +1464,8 @@ impl WorkbookLoad {
                     other => other,
                 });
             }
-            tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %self.filename, "created table from workbook sheet");
-            tables.push(table_name.into_string());
+            tracing::info!(table = table_name.as_str(), sheet = %sheet.sheet, rows = sheet.rows, file = %self.filename, "created table from workbook sheet");
+            tables.push(table_name.into_name());
         }
         Ok(tables)
     }
