@@ -144,7 +144,7 @@ impl Assertion {
     ///
     /// Returns an error when signing fails.
     pub(crate) fn append_to(&self, body: &mut Vec<u8>) -> Result<()> {
-        let mut form = oauth2::url::form_urlencoded::Serializer::new(String::new());
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
         for (key, value) in self.params()? {
             form.append_pair(key, &value);
         }
