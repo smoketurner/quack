@@ -23,7 +23,7 @@ use quack_core::graph::{
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ingestion::parser::SectionKind;
 use quack_core::ontology::candidates::{self, Queue};
-use quack_core::ontology::induction::{Candidate, ItemKind, Proposal};
+use quack_core::ontology::induction::{Candidate, Decision, ItemKind, Proposal};
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{
     self, Class, IdRenames, Mapping, MappingRelation, Ontology, OntologyVersion, Relation, store,
@@ -1618,6 +1618,39 @@ fn shipments_with_a_subclass_and_candidates() -> WorkspaceDb {
     )
     .unwrap();
     db
+}
+
+/// A review that accepts some candidates and rejects others is one
+/// decision: when any part is refused, no candidate changes.
+#[test]
+fn a_refused_review_decides_no_candidate() {
+    let db = shipments_with_a_subclass_and_candidates();
+    let open = |queue| candidates::queue(&db, queue).unwrap();
+    let weight = open(Queue::Pending).first().unwrap().id.to_string();
+    let routed = open(Queue::LowSupport).first().unwrap().id.to_string();
+    let versions = store::versions(&db, 10).unwrap().len();
+    for (accept, reject) in [
+        (
+            vec![String::from("no-such-candidate")],
+            vec![routed.clone()],
+        ),
+        (vec![weight.clone()], vec![weight.clone()]),
+    ] {
+        let decisions: Vec<(String, Decision)> = accept
+            .into_iter()
+            .map(|id| (id, Decision::Accept))
+            .collect();
+        assert!(candidates::decide(&db, &decisions, &reject, Some("ada")).is_err());
+        assert_eq!(open(Queue::Pending).len(), 1);
+        assert_eq!(open(Queue::LowSupport).len(), 1);
+        assert_eq!(store::versions(&db, 10).unwrap().len(), versions);
+    }
+    let review =
+        candidates::decide(&db, &[(weight, Decision::Accept)], &[routed], Some("ada")).unwrap();
+    assert_eq!(review.rejected, 1);
+    assert!(review.version.is_some());
+    assert!(open(Queue::Pending).is_empty());
+    assert!(open(Queue::LowSupport).is_empty());
 }
 
 /// Renaming a class moves everything in the ontology that names it: its

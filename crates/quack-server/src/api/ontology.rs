@@ -591,21 +591,12 @@ impl Access {
             let author = self.identity.username.clone();
             let (accepting, rejecting) = (accept.clone(), reject.clone());
             let (version, rejected) = with_db(db, move |db| {
-                let rejected = if rejecting.is_empty() {
-                    0
-                } else {
-                    candidates::reject(db, &rejecting, Some(&author))?
-                };
-                let version = if accepting.is_empty() {
-                    None
-                } else {
-                    let decisions: Vec<(String, Decision)> = accepting
-                        .into_iter()
-                        .map(|id| (id, Decision::Accept))
-                        .collect();
-                    candidates::accept(db, &decisions, Some(&author))?.version
-                };
-                Ok((version, rejected))
+                let decisions: Vec<(String, Decision)> = accepting
+                    .into_iter()
+                    .map(|id| (id, Decision::Accept))
+                    .collect();
+                let review = candidates::decide(db, &decisions, &rejecting, Some(&author))?;
+                Ok((review.version.and_then(|o| o.version), review.rejected))
             })
             .await?;
             audit.set_detail(serde_json::json!({

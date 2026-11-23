@@ -410,28 +410,60 @@ pub enum AutoAcceptance {
     },
 }
 
-/// Reject candidates: nothing changes in the ontology.
+/// Candidates decided together, checked open before anything is written,
+/// and marked in one transaction (the ontology save's, when one is made).
+#[derive(Debug, Default)]
+pub struct Decided<'a> {
+    accepted: Vec<CandidateId>,
+    rejected: Vec<CandidateId>,
+    by: Option<&'a str>,
+}
+
+impl Decided<'_> {
+    pub(super) fn mark(&self, db: &WorkspaceDb) -> Result<()> {
+        for (status, ids) in [
+            (CandidateStatus::Accepted, &self.accepted),
+            (CandidateStatus::Rejected, &self.rejected),
+        ] {
+            for id in ids {
+                db.connection().execute(
+                    "UPDATE _quack_ontology_candidates SET status = ?, decided_by = ?, decided_at = now() WHERE id = ?",
+                    duckdb::params![status, self.by, id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The pending candidate `id` names, refused when it is already decided.
+fn open_candidate(db: &WorkspaceDb, id: &str) -> Result<CandidateRow> {
+    let row = find(db, id)?;
+    if !row.status.is_open() {
+        return Err(Error::Ontology(format!(
+            "candidate {} is already {}",
+            row.id, row.status
+        )));
+    }
+    Ok(row)
+}
+
+/// What [`decide`] did: the version the accepted candidates made, if any,
+/// and how many were rejected.
+#[derive(Debug, Clone)]
+pub struct Review {
+    pub version: Option<Ontology>,
+    pub rejected: usize,
+}
+
+/// Reject candidates: nothing changes in the ontology. Every id is checked
+/// first, and all are marked or none.
 ///
 /// # Errors
 ///
 /// Returns an error when an id does not match a pending candidate.
 pub fn reject(db: &WorkspaceDb, ids: &[String], decided_by: Option<&str>) -> Result<usize> {
-    let mut count: usize = 0;
-    for id in ids {
-        let row = find(db, id)?;
-        if !row.status.is_open() {
-            return Err(Error::Ontology(format!(
-                "candidate {} is already {}",
-                row.id, row.status
-            )));
-        }
-        db.connection().execute(
-            "UPDATE _quack_ontology_candidates SET status = ?, decided_by = ?, decided_at = now() WHERE id = ?",
-            duckdb::params![CandidateStatus::Rejected, decided_by, row.id],
-        )?;
-        count = count.saturating_add(1);
-    }
-    Ok(count)
+    decide(db, &[], ids, decided_by).map(|d| d.rejected)
 }
 
 /// Apply decisions to pending candidates and save the result as a new
@@ -456,16 +488,62 @@ fn accept_as(
     decided_by: Option<&str>,
     acceptance: Acceptance,
 ) -> Result<Ontology> {
-    let mut resolved = Vec::with_capacity(decisions.len());
-    for (id, decision) in decisions {
-        let row = find(db, id)?;
-        if !row.status.is_open() {
+    decide_as(db, decisions, &[], decided_by, acceptance)?
+        .version
+        .ok_or_else(|| Error::Ontology(String::from("no candidate to accept")))
+}
+
+/// Accept some candidates and reject others as one decision: every id is
+/// checked first, and the new version (when any is accepted) and every
+/// candidate's status commit together or not at all.
+///
+/// # Errors
+///
+/// Returns an error when an id does not match a pending candidate, names
+/// one candidate both ways, or the resulting ontology is invalid.
+pub fn decide(
+    db: &WorkspaceDb,
+    accept: &[(String, Decision)],
+    reject: &[String],
+    decided_by: Option<&str>,
+) -> Result<Review> {
+    decide_as(db, accept, reject, decided_by, Acceptance::Reviewed)
+}
+
+fn decide_as(
+    db: &WorkspaceDb,
+    accept: &[(String, Decision)],
+    reject: &[String],
+    decided_by: Option<&str>,
+    acceptance: Acceptance,
+) -> Result<Review> {
+    let mut resolved = Vec::with_capacity(accept.len());
+    for (id, decision) in accept {
+        let row = open_candidate(db, id)?;
+        resolved.push((row.id, row.proposal, decision.clone()));
+    }
+    let mut decided = Decided {
+        by: decided_by,
+        ..Decided::default()
+    };
+    for id in reject {
+        let row = open_candidate(db, id)?;
+        if resolved.iter().any(|(accepted, _, _)| *accepted == row.id) {
             return Err(Error::Ontology(format!(
-                "candidate {} is already {}",
-                row.id, row.status
+                "candidate {} is both accepted and rejected",
+                row.id
             )));
         }
-        resolved.push((row.id, row.proposal, decision.clone()));
+        decided.rejected.push(row.id);
+    }
+    decided.accepted = resolved.iter().map(|(id, _, _)| id.clone()).collect();
+    let rejected = decided.rejected.len();
+    if resolved.is_empty() {
+        db.write_transaction(|db| decided.mark(db))?;
+        return Ok(Review {
+            version: None,
+            rejected,
+        });
     }
     let base = store::current(db)?;
     let proposals: Vec<(Proposal, Decision)> = resolved
@@ -486,15 +564,13 @@ fn accept_as(
             note: Some(&note),
             acceptance,
             renames: None,
+            decided: Some(&decided),
         },
     )?;
-    for (id, _, _) in &resolved {
-        db.connection().execute(
-            "UPDATE _quack_ontology_candidates SET status = ?, decided_by = ?, decided_at = now() WHERE id = ?",
-            duckdb::params![CandidateStatus::Accepted, decided_by, id],
-        )?;
-    }
-    Ok(stored)
+    Ok(Review {
+        version: Some(stored),
+        rejected,
+    })
 }
 
 /// Accept the pending candidates one run queued as proposed (`--auto-accept`
