@@ -510,15 +510,20 @@ impl Access {
                         version: None,
                     });
                 }
-                let run = candidates::store_run(db, &proposals)?;
-                let version = if auto_accept {
-                    match candidates::accept_run(db, &run, Some(&author))? {
-                        AutoAcceptance::Accepted(stored) => stored.ontology.version,
-                        AutoAcceptance::KeptAside { .. } => None,
-                    }
-                } else {
-                    None
-                };
+                // The proposal and its acceptance commit together, so a
+                // refused accept leaves no orphaned run behind.
+                let (run, version) = db.write_transaction(|db| {
+                    let run = candidates::store_run(db, &proposals)?;
+                    let version = if auto_accept {
+                        match candidates::accept_run(db, &run, Some(&author))? {
+                            AutoAcceptance::Accepted(stored) => stored.ontology.version,
+                            AutoAcceptance::KeptAside { .. } => None,
+                        }
+                    } else {
+                        None
+                    };
+                    Ok((run, version))
+                })?;
                 Ok(TableProposal {
                     candidates: proposals.len(),
                     run: Some(run),

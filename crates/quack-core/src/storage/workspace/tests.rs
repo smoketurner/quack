@@ -3191,6 +3191,12 @@ fn forget_user_rewrites_every_table_that_names_a_person() {
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(left, 0, "{table}.{column}");
     }
+    // A deletion stopped by a later workspace runs again: what was already
+    // rewritten is not rewritten twice.
+    let again = db
+        .forget_user(&UserId::from("u-bob"), "bob")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(again, 0);
 }
 
 /// A listing pages by id, newest first, with the last document's id as the
@@ -3630,4 +3636,38 @@ fn the_lambda_keyword_runs_and_the_arrow_form_is_refused() {
             .is_err(),
         "the arrow form ran; DuckDB re-enabled it"
     );
+}
+
+/// A `write_transaction` inside another joins it: both commit together, and
+/// an inner error rolls back the outer writes too.
+#[test]
+fn a_nested_write_transaction_commits_and_rolls_back_with_the_outer_one() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_with_params("CREATE TABLE steps (n INTEGER)", [])
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let count = |db: &WorkspaceDb| -> i64 {
+        db.connection()
+            .query_row("SELECT count(*) FROM steps", [], |r| r.get(0))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    db.write_transaction(|db| {
+        db.execute_with_params("INSERT INTO steps VALUES (1)", [])?;
+        db.write_transaction(|db| db.execute_with_params("INSERT INTO steps VALUES (2)", []))
+    })
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(count(&db), 2);
+    let refused = db.write_transaction(|db| {
+        db.execute_with_params("INSERT INTO steps VALUES (3)", [])?;
+        db.write_transaction(|_| Err::<(), _>(Error::Analysis(String::from("refused"))))
+    });
+    assert!(refused.is_err());
+    assert_eq!(
+        count(&db),
+        2,
+        "the outer step rolled back with the inner error"
+    );
+    db.write_transaction(|db| db.execute_with_params("INSERT INTO steps VALUES (4)", []))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(count(&db), 3, "a transaction opens again after the refusal");
 }
