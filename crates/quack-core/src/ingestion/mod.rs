@@ -226,7 +226,47 @@ pub struct NewFile<'a> {
     pub types: ColumnTypes,
 }
 
+impl DocumentFields {
+    /// Write these fields onto `existing` (the stored document a duplicate
+    /// upload matched) and return it as it now reads; nothing given is
+    /// nothing written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a date does not read as one or the update fails.
+    pub async fn apply_to(
+        self,
+        db: &Writer,
+        existing: Box<DocumentInfo>,
+    ) -> Result<Box<DocumentInfo>> {
+        if self.is_empty() {
+            return Ok(existing);
+        }
+        let id = existing.id.clone();
+        let updated = db
+            .run(move |db| {
+                db.set_document_fields(&id, &self)?;
+                db.document(&id)
+            })
+            .await?;
+        Ok(updated.map_or(existing, Box::new))
+    }
+}
+
 impl<'a> NewFile<'a> {
+    /// What the uploader said about the file, its title included: written
+    /// onto the stored document when the bytes are a duplicate.
+    fn given_fields(&self) -> DocumentFields {
+        DocumentFields {
+            title: self
+                .fields
+                .title
+                .clone()
+                .or_else(|| self.title.map(str::to_owned)),
+            ..self.fields.clone()
+        }
+    }
+
     /// A file already in memory, with no title or uploader.
     #[must_use]
     pub fn new(filename: &'a str, data: &'a [u8]) -> Self {
@@ -353,7 +393,11 @@ pub async fn ingest_file<M: EmbeddingModel>(
     let pending = Pending::of(config, file, measured)?;
     let doc_id = match db.run(move |db| pending.register(db)).await? {
         Registration::New(id) => id,
-        Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
+        Registration::Duplicate(existing) => {
+            return Ok(IngestOutcome::Duplicate(
+                file.given_fields().apply_to(db, existing).await?,
+            ));
+        }
     };
     let result = Processing {
         config,

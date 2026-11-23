@@ -143,3 +143,37 @@ fn a_fresh_ingest_with_pin_pins_the_new_document() {
         "the new document should be pinned: {docs}"
     );
 }
+
+/// A duplicate ingest writes the fields it was given onto the stored
+/// document instead of dropping them.
+#[test]
+fn a_duplicate_ingest_writes_its_given_fields() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let root = dir.path();
+    write(root, "config/config.toml", CONFIG);
+    write(root, "notes.md", "# Notes\n\nQuarterly figures.\n");
+    let file_arg = root.join("notes.md").display().to_string();
+    ran(&quack(root, &["ingest", &file_arg, "--no-embed"]), true);
+    let (stdout, _) = ran(
+        &quack(
+            root,
+            &[
+                "ingest",
+                &file_arg,
+                "--no-embed",
+                "--title",
+                "Q3 notes",
+                "--author",
+                "Ada",
+                "--tag",
+                "finance",
+            ],
+        ),
+        true,
+    );
+    assert!(stdout.contains("Skipped:"), "{stdout}");
+    let (listing, _) = ran(&quack(root, &["docs", "--format", "json"]), true);
+    for given in ["Q3 notes", "Ada", "finance"] {
+        assert!(listing.contains(given), "{given} missing from {listing}");
+    }
+}
