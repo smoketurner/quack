@@ -104,7 +104,8 @@ pub(crate) struct NewMember {
 
 impl Access {
     /// Give a user a role in this workspace, from the API or the web
-    /// console; an existing member's role changes.
+    /// console; an existing member's role changes. `Gone` when the
+    /// membership was removed while its role was being changed.
     pub(crate) async fn add_member(&self, app: &App, member: &AddMember) -> ApiResult<NewMember> {
         // The member row commits with the change, so the work writes its own
         // access row; this records only a request that fails before that.
@@ -142,7 +143,8 @@ impl Access {
                 )
             };
             let entry = self.committed_entry(action);
-            app.control
+            let added = app
+                .control
                 .set_member(
                     &self.membership.workspace.id,
                     &user.id,
@@ -151,7 +153,18 @@ impl Access {
                 )
                 .await?;
             audit.already_recorded();
+            let detail = if added {
+                detail
+            } else {
+                serde_json::json!({ "role": member.role, "reason": "no longer a member" })
+            };
             self.record_detail(app, &entry, Some(detail)).await?;
+            if !added {
+                return Err(ApiError::gone(
+                    "the membership was removed while the role was being changed; nothing was \
+                     changed",
+                ));
+            }
             Ok(NewMember {
                 user_id: user.id,
                 username: user.username,

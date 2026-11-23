@@ -720,7 +720,7 @@ impl MemberAction {
             } => {
                 let username = username.unwrap_or_default();
                 let user = control.user_named(&username).await?;
-                control
+                let added = control
                     .set_member(
                         &ws.id,
                         &user.id,
@@ -729,7 +729,16 @@ impl MemberAction {
                     )
                     .await?;
                 let mut out = stdout.lock();
-                writeln!(out, "{} is now {role} of '{}'.", user.username, ws.name)?;
+                if added {
+                    writeln!(out, "{} is now {role} of '{}'.", user.username, ws.name)?;
+                } else {
+                    writeln!(
+                        out,
+                        "{} was removed from '{}' while their role was being changed; nothing \
+                         was changed. Try again.",
+                        user.username, ws.name
+                    )?;
+                }
                 out.flush()?;
             }
             Self::Remove {

@@ -653,25 +653,52 @@ async fn members_need_a_user_and_a_workspace() {
             .await
             .is_err()
     );
+    // An add touches a row, so the bool is true on the INSERT path.
     assert!(
         cp.set_member(&ws.id, &bob.id, Role::Viewer, setup_audit())
             .await
-            .is_ok()
+            .is_ok_and(|added| added)
     );
     assert!(
         cp.member_role(&ws.id, &bob.id)
             .await
             .is_ok_and(|r| r == Some(Role::Viewer))
     );
+    // A role change touches a row, so the bool is true on the UPDATE path.
     assert!(
         cp.set_member(&ws.id, &bob.id, Role::Owner, setup_audit())
             .await
-            .is_ok()
+            .is_ok_and(|added| added)
     );
     assert!(
         cp.member_role(&ws.id, &bob.id)
             .await
             .is_ok_and(|r| r == Some(Role::Owner))
+    );
+    // The change is audited as Allowed, not as a no-op Error.
+    let audit_rows = cp
+        .query_audit(&AuditFilter {
+            limit: 100,
+            ..AuditFilter::default()
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows;
+    assert!(
+        audit_rows.iter().any(|r| {
+            r.entry.workspace_id.as_ref() == Some(&ws.id)
+                && r.entry.resource_id.as_deref() == Some(bob.id.as_str())
+                && r.entry.outcome == Outcome::Allowed
+        }),
+        "the role change to Owner is audited as Allowed: {audit_rows:?}"
+    );
+    assert!(
+        !audit_rows.iter().any(|r| {
+            r.entry.workspace_id.as_ref() == Some(&ws.id)
+                && r.entry.resource_id.as_deref() == Some(bob.id.as_str())
+                && r.entry.outcome == Outcome::Error
+        }),
+        "a successful role change must not be audited as Error: {audit_rows:?}"
     );
     let listed = cp.list_members(&ws.id).await;
     assert!(listed.is_ok_and(|m| m.len() == 1 && m.first().is_some_and(|m| m.username == "bob")));
@@ -694,6 +721,101 @@ async fn members_need_a_user_and_a_workspace() {
     );
     assert!(Role::Viewer < Role::Member && Role::Member < Role::Owner);
     assert!("boss".parse::<Role>().is_err());
+}
+
+/// A membership removed between `set_member`'s `member_role` read and its
+/// `UPDATE` is a no-op: `set_member` returns `Ok(false)`, the membership is
+/// gone, and its audit row is `Error` — never a misleading `Ok(())` that
+/// reports a role the database does not reflect. `set_member`'s read and
+/// write are separate pool acquisitions, and the pool has one connection, so
+/// holding it until `set` and `remove` have both queued, then releasing,
+/// services them in order: `set` reads bob, `remove` deletes bob, `set`'s
+/// `UPDATE` then matches no row.
+#[tokio::test]
+async fn set_member_reports_a_no_op_when_the_membership_is_removed_under_it() {
+    let (_dir, cp) = open().await;
+    let ws = cp
+        .create_workspace(&workspace_name("w"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let bob = cp
+        .create_user("bob", "pw", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_member(&ws.id, &bob.id, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    // Hold the single pool connection so both `set` and `remove` queue on
+    // it before either runs; the spawn order fixes the queue order, so
+    // releasing the connection services them in order (sqlx 0.9's pool is
+    // FIFO).
+    let held = cp
+        .pool
+        .acquire()
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let cp_set = cp.clone();
+    let ws_set = ws.id.clone();
+    let bob_set = bob.id.clone();
+    let set = tokio::spawn(async move {
+        cp_set
+            .set_member(&ws_set, &bob_set, Role::Owner, setup_audit())
+            .await
+    });
+    // Let `set` reach `member_role`'s acquire and register as a waiter.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    let cp_remove = cp.clone();
+    let ws_remove = ws.id.clone();
+    let bob_remove = bob.id.clone();
+    let remove = tokio::spawn(async move {
+        cp_remove
+            .remove_member(&ws_remove, &bob_remove, setup_audit())
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    // Release the connection: `set` reads bob (Viewer) and releases it;
+    // `remove` deletes bob and commits; `set`'s `UPDATE` then matches no row.
+    drop(held);
+    let added = set.await.unwrap_or_else(|e| fail(&e.to_string()));
+    let removed = remove.await.unwrap_or_else(|e| fail(&e.to_string()));
+
+    let added = added.unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        !added,
+        "set_member must surface a no-op as Ok(false), not Ok(true): {added:?}"
+    );
+    let removed = removed.unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        removed,
+        "remove_member must have deleted the row that set_member then missed"
+    );
+
+    assert!(
+        cp.member_role(&ws.id, &bob.id)
+            .await
+            .is_ok_and(|r| r.is_none()),
+        "bob must not be a member after the race"
+    );
+
+    let rows = cp
+        .query_audit(&AuditFilter {
+            limit: 100,
+            ..AuditFilter::default()
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows;
+    assert!(
+        rows.iter().any(|r| {
+            r.entry.workspace_id.as_ref() == Some(&ws.id)
+                && r.entry.resource_id.as_deref() == Some(bob.id.as_str())
+                && r.entry.outcome == Outcome::Error
+        }),
+        "the no-op set_member must be audited as Error: {rows:?}"
+    );
 }
 
 #[tokio::test]

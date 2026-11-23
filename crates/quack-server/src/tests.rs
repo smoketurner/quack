@@ -526,6 +526,189 @@ async fn login_sets_a_cookie_and_audits_both_outcomes() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// `POST /workspaces/{id}/members` returns `200` with `NewMember` for a new
+/// member and for a role change, so the race fix does not regress the happy
+/// path: the requested role is the role the database reflects.
+#[tokio::test(flavor = "multi_thread")]
+async fn add_member_returns_new_member_for_an_add_and_a_role_change() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let token = h.login("owner").await;
+
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &token,
+            serde_json::json!({ "username": "bob", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"].as_str(), Some(bob.as_str()), "{body}");
+    assert_eq!(body["username"], "bob", "{body}");
+    assert_eq!(body["role"], "viewer", "{body}");
+    assert!(
+        h.app
+            .control
+            .member_role(&ws, &bob)
+            .await
+            .is_ok_and(|r| r == Some(Role::Viewer)),
+        "bob is a viewer"
+    );
+
+    // A role change returns the new role and the database reflects it.
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/members"),
+            &token,
+            serde_json::json!({ "username": "bob", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "owner", "{body}");
+    assert!(
+        h.app
+            .control
+            .member_role(&ws, &bob)
+            .await
+            .is_ok_and(|r| r == Some(Role::Owner)),
+        "bob is now an owner"
+    );
+}
+
+/// `POST /workspaces/{id}/members` answers `410 Gone` — never `200` with a
+/// role the database does not reflect — when the membership is removed
+/// between `set_member`'s read and its `UPDATE`. A second pool holds an
+/// uncommitted `DELETE` of the membership: in WAL the route's `member_role`
+/// read sees the member and takes the `UPDATE` branch, the `UPDATE` then
+/// waits on the write lock the delete holds, and once it commits the row is
+/// gone, so the `UPDATE` is a no-op, audited as `Error`, and the response is
+/// `Gone`. A bounded retry covers the scheduling case where the request
+/// runs entirely after the delete and re-inserts the member (`200`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_member_answers_gone_when_the_membership_is_removed_under_it() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let token = h.login("owner").await;
+    let url = format!(
+        "sqlite:{}",
+        h.app
+            .engine
+            .config
+            .general
+            .data_dir
+            .join("control.db")
+            .display()
+    );
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    let mut saw_gone = false;
+    for _ in 0..8 {
+        // Reset bob to a viewer so the request's read has a member to change.
+        let _: bool = h
+            .app
+            .control
+            .remove_member(&ws, &bob, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let added: bool = h
+            .app
+            .control
+            .set_member(&ws, &bob, Role::Viewer, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(added, "the reset viewer grant must take");
+
+        // Hold an uncommitted DELETE of bob's membership: the route's read
+        // sees the committed state (bob present), and its UPDATE waits on
+        // this write lock until the DELETE commits and the row is gone.
+        let mut held = pool.begin().await.unwrap_or_else(|e| fail(&e.to_string()));
+        sqlx::query("DELETE FROM members WHERE workspace_id = ? AND user_id = ?")
+            .bind(ws.as_str())
+            .bind(bob.as_str())
+            .execute(&mut *held)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let router = h.router.clone();
+        let path = format!("/api/v1/workspaces/{ws}/members");
+        let bearer = token.clone();
+        let inflight = tokio::spawn(async move {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "username": "bob", "role": "owner" }).to_string(),
+                ))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let response = router
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            });
+            (status, body)
+        });
+
+        // Let the request read `member_role` (WAL sees bob) and block on the
+        // held write lock at the UPDATE; the pool's busy timeout is 5 s, so
+        // this is well within the wait. Commit the delete; the blocked
+        // UPDATE now matches no row.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        held.commit().await.unwrap_or_else(|e| fail(&e.to_string()));
+
+        let (status, body) = inflight.await.unwrap_or_else(|e| fail(&e.to_string()));
+        if status == StatusCode::GONE {
+            saw_gone = true;
+            assert_eq!(body["code"], "gone", "{body}");
+            assert!(
+                h.app
+                    .control
+                    .member_role(&ws, &bob)
+                    .await
+                    .is_ok_and(|r| r.is_none()),
+                "bob must not be a member after the race: {body}"
+            );
+            let rows = h
+                .audit(AuditFilter {
+                    workspace_id: Some(ws.clone()),
+                    action: Some(String::from("member")),
+                    limit: 100,
+                    ..AuditFilter::default()
+                })
+                .await;
+            assert!(
+                rows.iter().any(|r| {
+                    r.entry.resource_id.as_deref() == Some(bob.as_str())
+                        && r.entry.outcome == Outcome::Error
+                }),
+                "the no-op add_member must be audited as Error: {rows:?}"
+            );
+            break;
+        }
+        // The request ran entirely after the delete committed: its read saw
+        // no member and it INSERTed bob back. The race did not land; reset
+        // and retry.
+        assert_eq!(status, StatusCode::OK, "unexpected status: {body}");
+    }
+    pool.close().await;
+    assert!(saw_gone, "the race never forced the no-op in 8 attempts");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn workspaces_follow_membership_roles_and_admin_limits() {
     let h = harness(ServeMode::Login).await;
