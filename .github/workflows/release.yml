@@ -61,6 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
+          # git-cliff needs the previous tag to find the commits since it.
+          fetch-depth: 0
           persist-credentials: false
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
