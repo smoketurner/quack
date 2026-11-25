@@ -5074,9 +5074,9 @@ dependencies = [
 
 [[package]]
 name = "rig"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd069b759ade994670fe523be7ef8d10367be387fe848e5c39e8228e2a912bf1"
+checksum = "8400c238ea633780bdd0f960eece8863f67e8d45fc01fa9048519447740cc18e"
 dependencies = [
  "rig-agent",
  "rig-bedrock",
@@ -5092,9 +5092,9 @@ dependencies = [
 
 [[package]]
 name = "rig-agent"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6b192f9c616fdf289a63419142d9322bd66a3336a4f64f9253064e36f7f3e1"
+checksum = "e6ee4a0b71d70a127ee16d53330f3990579de37fb32aaf6c27a5c349f45e3a40"
 dependencies = [
  "async-stream",
  "futures",
@@ -5113,9 +5113,9 @@ dependencies = [
 
 [[package]]
 name = "rig-bedrock"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f5c76e5829af320f320cc43692180f30a770e484bfbb2c76a3009dd9a0a5011"
+checksum = "413e136d8bafdee5a45116c23b2f3eb707f67a001f456bca679ca5626ff51d97"
 dependencies = [
  "async-stream",
  "aws-config",
@@ -5138,9 +5138,9 @@ dependencies = [
 
 [[package]]
 name = "rig-cassette"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06b049dc8e86e018fd31950ef5fb64ce2cff560cb6d74262892e2664f84418b2"
+checksum = "f599e922761871fba733234fa3e7d6ce2494e0330cdc19b1ba80d67f92d163c6"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -5152,9 +5152,9 @@ dependencies = [
 
 [[package]]
 name = "rig-core"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5b60ad1761accbb5ef3ef97a038903345d60768d7a5a5a09e01e16dfac0f699"
+checksum = "8ea12b6d2a5d2591192636d30af2981ce180b45204e19b7f14ce1347215603c8"
 dependencies = [
  "async-stream",
  "base64 0.23.1",
@@ -5186,9 +5186,9 @@ dependencies = [
 
 [[package]]
 name = "rig-derive"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8d640289fad26c93ba4d3f8cf329f27518269a1ceac1213282e87c7e0ef6f6f"
+checksum = "44c6574c1c31b6700e6030cee43bdb63eff9b9d555e1b1be3eb571bdc40f5c39"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro-crate",
@@ -5199,9 +5199,9 @@ dependencies = [
 
 [[package]]
 name = "rig-http"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "041fa0a6e1d1236cbc502516e3fa71ac3dddbd91c3594a81436c6bee9c8acc41"
+checksum = "06e3c63862bb7f08460f95815ee82dc883a59409883c4e60aa19ade0556864a8"
 dependencies = [
  "bytes",
  "futures",
@@ -5215,9 +5215,9 @@ dependencies = [
 
 [[package]]
 name = "rig-memory"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f13b53e3b513ebd44e9cb9faf897d3792ec312751052e6788e5f4af7735114"
+checksum = "0a29509f0a89f4f865ecaee6296c8ff48fc39ff23ad0769515f95ea65ca0bb7e"
 dependencies = [
  "base64 0.23.1",
  "memchr",
@@ -5229,9 +5229,9 @@ dependencies = [
 
 [[package]]
 name = "rig-postgres"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df7739728173d1a59a04418c8dfbc3df295d6985392f133a464827dbca8df17"
+checksum = "496c289699cce43af697ba533cb07b70e53da96b937bace07ce189faac301031"
 dependencies = [
  "pgvector",
  "rig-core",
@@ -5244,9 +5244,9 @@ dependencies = [
 
 [[package]]
 name = "rig-reqwest"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab589224b5831dba19bc22784cd083aa5b7424d7068db515e631878da6f5309"
+checksum = "aac938aaebb4c0ab051444da7846c128fec2648c82826dd938ee2af02fbc1963"
 dependencies = [
  "bytes",
  "futures",
@@ -5259,9 +5259,9 @@ dependencies = [
 
 [[package]]
 name = "rig-sqlite"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea507fa4ca0a0946992331a29cfdb98a52b0c8e3d97268c0b8eab6994d12327"
+checksum = "7de159e3ce205da56162251fe6867de45b3bff07958cbe636696fa6ac906355e"
 dependencies = [
  "rig-core",
  "rig-memory",
@@ -5276,9 +5276,9 @@ dependencies = [
 
 [[package]]
 name = "rig-typesafeai"
-version = "0.47.0"
+version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "371f6806eca9c2008f3813d3a0bbdf7513f910aab65501370fe6945bff1133e8"
+checksum = "c1a1117e7d9f3f3ba9fe79f8f502851b27aa3262dcbd452fb077cacbafe0cd37"
 dependencies = [
  "http",
  "rig-core",
